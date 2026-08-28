@@ -208,6 +208,13 @@ describe("rendering", () => {
       "/tmp/ws",
     );
     expect(preamble).toContain("/tmp/ws");
+    // The continuation rule is what carries a multi-step task across the turn
+    // gap — a text protocol has no `stop_reason: "tool_use"` to resume from.
+    // It is phrased around completion and names its exits, because an
+    // open-ended "keep going" is the phrasing that spins.
+    expect(preamble).toContain("Work the task through to completion");
+    expect(preamble).toMatch(/Stop when the task is done/);
+    expect(preamble).toMatch(/denied/);
     // The worked example must not name a real file: it parses as a valid call
     // and lives in a user message, so a scanner bug would execute it.
     expect(preamble).toContain("path/to/file.txt");

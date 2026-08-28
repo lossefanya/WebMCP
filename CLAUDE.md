@@ -31,6 +31,58 @@ Two rules that come from getting this wrong:
 the full command reference. When a detail is too deep for it, put the detail here and leave the
 README a correct one-liner that points across — never a wrong one, and never silence.
 
+## Devlog format
+
+One file per working session in `devlog/`, named `YYYY-MM-DD-kebab-slug.md`. Write it when a session
+ends, or when asked. The format below is the house style — follow it rather than re-deriving it from
+the existing entries.
+
+```markdown
+# YYYY-MM-DD — Short title, and the thing that made the session interesting
+
+Two or three sentences: what the session set out to do, and what it actually turned into.
+
+**Final state:** N tests green (X daemon, Y extension), up from the previous entry. Diff stats, and
+new files by name.
+
+---
+
+## <A section per theme, named for the thing, not the phase>
+
+Prose. Then a `### heading` per bug or decision, each one: what broke, why it mattered, **Fix:** what
+changed. Quote the actual selector, flag, or error where there is one.
+
+---
+
+## What I'd do differently
+
+The honest part. Process failures, not just code ones.
+
+## Open items
+
+What is knowingly unfinished, and why.
+```
+
+What earns a place, in rough priority order:
+
+- **A bug and the reasoning that produced it.** Not "fixed X" — what the wrong assumption was, what it
+  cost, and what made it visible. An entry that only lists changes is a changelog; `git log` is
+  already that.
+- **Anything a test caught that reading could not**, and anything a test *failed* to catch. Both are
+  the useful signal.
+- **Decisions with a rejected alternative.** Record what was not done and why, because that is the
+  part no diff shows.
+- **Who found each problem.** "The user hit this in five minutes" is data about where the verification
+  was thin, and it belongs in the log rather than being smoothed over.
+
+Two habits that keep these worth reading:
+
+- **Verify the numbers before writing them.** Test counts, diff stats and dates go in from a command
+  run in that session, never from memory — the same rule as `README.md` above. One stat was wrong in
+  the first draft of the 2026-08-29 entry because `git diff --stat` counts only tracked files.
+- **Write the failures at full strength.** The value is concentrated in what went wrong; a devlog that
+  reads like a victory lap is one nobody consults later. If a fix was a second attempt, say it was.
+
 ## Status
 
 First implementation has landed. Both halves build, and the daemon has a test suite covering the
