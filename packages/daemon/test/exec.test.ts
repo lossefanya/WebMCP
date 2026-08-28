@@ -39,7 +39,7 @@ describe("exec_run", () => {
   });
 
   it("refuses everything when the allowlist is empty", async () => {
-    await expect(run({ command: "ls", args: [] }, { exec: { allow: [], timeoutMs: 1000, maxOutputBytes: 1000 } })).rejects.toThrow(
+    await expect(run({ command: "ls", args: [] }, { exec: { allow: [], timeoutMs: 1000, maxTimeoutMs: 20_000, maxOutputBytes: 1000 } })).rejects.toThrow(
       /exec is disabled/,
     );
   });
@@ -56,6 +56,39 @@ describe("exec_run", () => {
     const result = await run({ command: "mkdir", args: ["-p", "nested/deep"] });
     expect(result.isError).toBe(false);
     await expect(fsp.stat(path.join(fixture.root, "nested", "deep"))).resolves.toBeDefined();
+  });
+
+  it("lets a slow command ask for longer than the default", async () => {
+    // `git clone` and `npm install` routinely outlive a default tuned so a
+    // wedged command does not hold the conversation. Clamping to the default
+    // meant they could never be given longer, whatever they asked for.
+    const started = Date.now();
+    const result = await run(
+      { command: "node", args: ["-e", "setTimeout(()=>console.log('finished'),1200)"], timeout_ms: 15_000 },
+      { exec: { allow: ["node"], timeoutMs: 400, maxTimeoutMs: 20_000, maxOutputBytes: 8_192 } },
+    );
+    expect(result.isError).toBe(false);
+    expect(result.content[0]?.text).toContain("finished");
+    expect(Date.now() - started).toBeGreaterThan(1_000);
+  });
+
+  it("still refuses to exceed the configured ceiling", async () => {
+    const result = await run(
+      { command: "node", args: ["-e", "setTimeout(()=>{},60000)"], timeout_ms: 999_999 },
+      { exec: { allow: ["node"], timeoutMs: 200, maxTimeoutMs: 700, maxOutputBytes: 8_192 } },
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain("timed out after 700ms");
+  });
+
+  it("tells the model how to retry when it kills a slow command", async () => {
+    // The status line is pasted into the conversation and is the only thing the
+    // model gets to act on. "It timed out" alone leaves it with no next move.
+    const result = await run(
+      { command: "node", args: ["-e", "setTimeout(()=>{},60000)"] },
+      { exec: { allow: ["node"], timeoutMs: 200, maxTimeoutMs: 90_000, maxOutputBytes: 8_192 } },
+    );
+    expect(result.content[0]?.text).toMatch(/retry with timeout_ms up to 90000/);
   });
 
   it("does not interpret shell metacharacters", async () => {
@@ -91,24 +124,27 @@ describe("exec_run", () => {
   it("kills a process that outlives its timeout", async () => {
     const result = await run(
       { command: "node", args: ["-e", "setTimeout(() => {}, 10000)"], timeout_ms: 300 },
-      { exec: { allow: ["node"], timeoutMs: 400, maxOutputBytes: 4096 } },
+      { exec: { allow: ["node"], timeoutMs: 400, maxTimeoutMs: 20_000, maxOutputBytes: 4096 } },
     );
     expect(result.content[0]?.text).toMatch(/timed out after/);
   });
 
-  it("caps the timeout at the configured ceiling", async () => {
+  it("applies the default timeout when a call does not ask for one", async () => {
+    // The default stays short on purpose: an unattended wedged command must not
+    // hold the conversation. Asking for longer is the opt-in, tested above.
     const started = Date.now();
-    await run(
-      { command: "node", args: ["-e", "setTimeout(() => {}, 10000)"], timeout_ms: 9_000 },
-      { exec: { allow: ["node"], timeoutMs: 300, maxOutputBytes: 4096 } },
+    const result = await run(
+      { command: "node", args: ["-e", "setTimeout(() => {}, 10000)"] },
+      { exec: { allow: ["node"], timeoutMs: 300, maxTimeoutMs: 20_000, maxOutputBytes: 4096 } },
     );
     expect(Date.now() - started).toBeLessThan(3_000);
+    expect(result.content[0]?.text).toContain("timed out after 300ms");
   });
 
   it("truncates output rather than pasting it all into the chat", async () => {
     const result = await run(
       { command: "node", args: ["-e", "process.stdout.write('x'.repeat(50000))"] },
-      { exec: { allow: ["node"], timeoutMs: 5_000, maxOutputBytes: 1_000 } },
+      { exec: { allow: ["node"], timeoutMs: 5_000, maxTimeoutMs: 20_000, maxOutputBytes: 1_000 } },
     );
     expect(result.content[0]?.truncated).toBe(true);
     expect(result.content[0]?.text).toMatch(/truncated/);

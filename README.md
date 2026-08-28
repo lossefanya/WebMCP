@@ -74,7 +74,12 @@ settings below grants rather than suggestions.
 - `port` — the loopback port the daemon listens on. Defaults to 8767; it is also what you type into
   the popup when pairing.
 - `exec.allow` — the binaries `exec_run` will run, by basename. An empty list removes the shell tool
-  from the daemon's advertised tools entirely rather than offering it and always refusing.
+  from the daemon's advertised tools entirely rather than offering it and always refusing. Setting
+  this replaces the built-in list rather than adding to it.
+- `exec.timeoutMs` / `exec.maxTimeoutMs` — how long a command may run: the default applied when a
+  call does not ask (30s, short so a wedged command cannot hold the conversation), and the ceiling a
+  call may ask for with `timeout_ms` (5 min). Slow work like `git clone` or `npm install` asks for
+  more; when a command is killed, the result says so and names the ceiling to retry with.
 - `mcpServers` — `claude_desktop_config.json` blocks verbatim, so you can paste ones you already have.
 
 A `limits` block tunes read/write ceilings and the approval timeout; see `CLAUDE.md` for those.

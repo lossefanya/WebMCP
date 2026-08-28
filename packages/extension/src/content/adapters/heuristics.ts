@@ -46,6 +46,37 @@ const USER_TURN_MARKERS = [
  * sides of the conversation cannot be scanned safely, so it is rejected rather
  * than trusted.
  */
+/**
+ * How far back a scan looks before doing any per-turn DOM work, and how many
+ * turns it ultimately reads.
+ *
+ * `touchesUserTurn` costs a full subtree `querySelector` per marker per turn,
+ * and a scan runs on every mutation and every poll. Filtering the whole
+ * conversation and *then* taking the tail made that cost grow with the length
+ * of the chat: each pasted result added a turn, every later scan walked all of
+ * them, and a session that read many files eventually stopped keeping up.
+ *
+ * The window is larger than the depth on purpose. Filtering is a safety net for
+ * a selector that over-matches, so it needs a few turns of slack — but bounded,
+ * because only the tail can hold a call that has not been handled yet.
+ */
+export const SCAN_WINDOW = 8;
+export const SCAN_DEPTH = 2;
+
+/**
+ * The turns a scan should actually read. Pure, so the cost is testable: the
+ * work here must not grow with the size of the conversation.
+ */
+export function turnsToScan(
+  turns: Element[],
+  depth: number = SCAN_DEPTH,
+  window: number = SCAN_WINDOW,
+): Element[] {
+  const recent = window > 0 ? turns.slice(-window) : turns;
+  const valid = recent.filter((turn) => !touchesUserTurn(turn));
+  return depth > 0 ? valid.slice(-depth) : valid;
+}
+
 export function touchesUserTurn(el: Element): boolean {
   for (const selector of USER_TURN_MARKERS) {
     try {

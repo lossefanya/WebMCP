@@ -45,7 +45,12 @@ export function testConfig(root: string, overrides: Partial<Config> = {}): Confi
     workspace: root,
     workspaces: [],
     port: 0,
-    exec: { allow: [...DEFAULT_EXEC_ALLOW], timeoutMs: 5_000, maxOutputBytes: 8_192 },
+    exec: {
+      allow: [...DEFAULT_EXEC_ALLOW],
+      timeoutMs: 5_000,
+      maxTimeoutMs: 20_000,
+      maxOutputBytes: 8_192,
+    },
     limits: {
       maxReadBytes: 4_096,
       maxWriteBytes: 1_024 * 1_024,

@@ -21,7 +21,15 @@ export interface McpServerConfig {
 export interface ExecConfig {
   /** Binary basenames the exec tool will run. Empty list disables exec entirely. */
   allow: string[];
+  /** Default kill time for a call that does not ask for one. */
   timeoutMs: number;
+  /**
+   * Ceiling on what a call may ask for. Separate from `timeoutMs` because the
+   * default wants to be short — a wedged command should not hold a chat turn
+   * for minutes — while `git clone` and `npm install` legitimately need longer
+   * and can say so.
+   */
+  maxTimeoutMs: number;
   maxOutputBytes: number;
 }
 
@@ -80,7 +88,12 @@ export const DEFAULT_EXEC_ALLOW = [
 
 const DEFAULTS = {
   port: DEFAULT_PORT,
-  exec: { allow: DEFAULT_EXEC_ALLOW, timeoutMs: 30_000, maxOutputBytes: 32_768 },
+  exec: {
+    allow: DEFAULT_EXEC_ALLOW,
+    timeoutMs: 30_000,
+    maxTimeoutMs: 300_000,
+    maxOutputBytes: 32_768,
+  },
   limits: {
     maxReadBytes: 64 * 1024,
     maxWriteBytes: 1024 * 1024,
@@ -230,6 +243,10 @@ export async function loadConfig(overrides: ConfigOverrides = {}): Promise<Confi
     exec: {
       allow: asStringArray(execRaw.allow) ?? [...DEFAULTS.exec.allow],
       timeoutMs: asNumber(execRaw.timeoutMs) ?? DEFAULTS.exec.timeoutMs,
+      maxTimeoutMs: Math.max(
+        asNumber(execRaw.maxTimeoutMs) ?? DEFAULTS.exec.maxTimeoutMs,
+        asNumber(execRaw.timeoutMs) ?? DEFAULTS.exec.timeoutMs,
+      ),
       maxOutputBytes: asNumber(execRaw.maxOutputBytes) ?? DEFAULTS.exec.maxOutputBytes,
     },
     limits: {

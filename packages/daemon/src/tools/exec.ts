@@ -36,7 +36,13 @@ const execRun: Tool = {
       properties: {
         command: { type: "string", description: "Binary name, e.g. 'git'. No paths." },
         args: { type: "array", items: { type: "string" }, description: "Arguments, one per element." },
-        timeout_ms: { type: "number", description: "Kill the process after this long." },
+        timeout_ms: {
+          type: "number",
+          description:
+            "Kill the process after this long, in ms. Raise it for slow commands " +
+            "like `git clone` or `npm install`; the default is short so a wedged " +
+            "command does not hold the conversation.",
+        },
       },
       required: ["command", "args"],
       additionalProperties: false,
@@ -50,12 +56,22 @@ const execRun: Tool = {
     checkExecArgs(args, ctx.config.exec.allow);
   },
   async run(args, ctx) {
-    const { allow, timeoutMs, maxOutputBytes } = ctx.config.exec;
+    const { allow, timeoutMs, maxTimeoutMs, maxOutputBytes } = ctx.config.exec;
     // Re-checked here as well: `run` must not depend on a caller having gone
     // through `validate` first.
     const { command, argv } = checkExecArgs(args, allow);
 
-    const limit = Math.min(optionalNumber(args, "timeout_ms") ?? timeoutMs, timeoutMs);
+    // A call may ask for *more* than the default, up to the configured ceiling.
+    // Clamping to the default instead meant `git clone` could never be given
+    // longer than 30s no matter what it asked for, and was killed mid-clone with
+    // no way for the model to do anything differently.
+    const asked = optionalNumber(args, "timeout_ms");
+    // A missing or nonsense ceiling degrades to the default rather than to NaN.
+    // `setTimeout(NaN)` fires immediately, so getting this wrong kills every
+    // command the instant it starts — a silent failure that looks like the
+    // command produced no output.
+    const ceiling = Number.isFinite(maxTimeoutMs) ? Math.max(maxTimeoutMs, timeoutMs) : timeoutMs;
+    const limit = Math.max(1, Math.min(asked ?? timeoutMs, ceiling));
 
     const child = spawn(command, argv, {
       cwd: ctx.workspace.root,
@@ -108,7 +124,14 @@ const execRun: Tool = {
 
         const timer = setTimeout(() => {
           kill(child, "SIGKILL");
-          finish({ code: null, signal: "SIGKILL", note: `timed out after ${limit}ms` });
+          // The remedy goes in the status line, because this text is pasted back
+          // into the conversation and is the only thing the model gets to act
+          // on. "It timed out" alone leaves it with no next move.
+          const remedy =
+            limit < maxTimeoutMs
+              ? ` — retry with timeout_ms up to ${maxTimeoutMs} if it needs longer`
+              : " — this is the configured maximum";
+          finish({ code: null, signal: "SIGKILL", note: `timed out after ${limit}ms${remedy}` });
         }, limit);
 
         const onAbort = () => {

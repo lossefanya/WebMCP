@@ -13,7 +13,7 @@ import {
   renderToolResult,
 } from "@webmcp/protocol";
 import { adapterForHost } from "./adapters/index.js";
-import { type WrappedAdapter, touchesUserTurn, withFallbacks } from "./adapters/heuristics.js";
+import { type WrappedAdapter, turnsToScan, withFallbacks } from "./adapters/heuristics.js";
 import { insertAndSubmit } from "./compose.js";
 import { blocksFromTurn } from "./serialize.js";
 
@@ -114,10 +114,12 @@ class Runner {
     // inside a user turn is one the model never made — it is the preamble's own
     // example, or a pasted-back result — and running it is a correctness bug no
     // amount of de-duplication fixes.
-    const turns = this.site.assistantTurns().filter((turn) => !touchesUserTurn(turn));
-    // Only the tail can contain a new call, and scanning a long conversation on
-    // every mutation is how an extension makes a chat UI feel broken.
-    for (const turn of turns.slice(-2)) {
+    // Bounded before the per-turn DOM work, not after. Only the tail can contain
+    // a call that has not been handled, and `touchesUserTurn` costs a subtree
+    // walk per marker — filtering the whole conversation first made every scan
+    // more expensive as the chat grew, which is how an extension makes a chat UI
+    // stop keeping up part-way through a session.
+    for (const turn of turnsToScan(this.site.assistantTurns())) {
       const { blocks, source } = blocksFromTurn(turn, streaming);
       this.lastBlocks = blocks;
 
