@@ -23,10 +23,18 @@ describe("DaemonServer", () => {
   const boot = async (overrides = {}) => {
     const config = testConfig(fixture.root, { port: 0, ...overrides });
     mcp = new McpManager(config, silentLogger);
-    policy = new Policy(config, silentLogger);
+    policy = new Policy(config, silentLogger, fixture.workspaces);
     await policy.load();
-    const registry = new Registry(fixture.workspace, config, mcp, silentLogger);
-    server = new DaemonServer({ config, registry, policy, mcp, token: TOKEN, log: silentLogger });
+    const registry = new Registry(config, mcp, silentLogger);
+    server = new DaemonServer({
+      config,
+      workspaces: fixture.workspaces,
+      registry,
+      policy,
+      mcp,
+      token: TOKEN,
+      log: silentLogger,
+    });
     port = await server.listen();
   };
 
@@ -49,6 +57,163 @@ describe("DaemonServer", () => {
     await server.close();
     await mcp.close();
     await fixture.cleanup();
+  });
+
+  describe("set_workspace", () => {
+    it("announces the granted roots on ready", async () => {
+      const client = await paired();
+      const ready = await client.next("ready");
+      expect(ready.workspace).toBe(fixture.root);
+      expect(ready.roots).toEqual([fixture.root, fixture.other]);
+    });
+
+    it("moves to a granted root and tells every session", async () => {
+      const one = await paired();
+      const two = await paired();
+
+      one.send({ kind: "set_workspace", id: "w1", root: fixture.other });
+
+      const answered = await one.next("workspace_changed", (m) => m.id === "w1");
+      expect(answered.workspace).toBe(fixture.other);
+
+      // The second tab is told too: a stale root in another popup is a lie
+      // about what the tools can reach.
+      const broadcast = await two.next("workspace_changed");
+      expect(broadcast.workspace).toBe(fixture.other);
+    });
+
+    it("refuses a root nobody granted, and does not move", async () => {
+      const client = await paired();
+      client.send({ kind: "set_workspace", id: "w1", root: fixture.outside });
+
+      const error = await client.next("error", (m) => m.id === "w1");
+      expect(error.code).toBe("workspace_refused");
+      expect(fixture.workspaces.root).toBe(fixture.root);
+
+      // And the tools still answer against the root that did not move.
+      client.send({ kind: "call_tool", id: "c1", name: "fs_read", args: { path: "a.txt" }, origin: ORIGIN });
+      const result = await client.next("result", (m) => m.id === "c1");
+      expect(result.result.isError).toBe(false);
+    });
+
+    it("cannot reach outside the granted roots through a symlink", async () => {
+      await fsp.symlink(fixture.outside, path.join(fixture.root, "shortcut"));
+      const client = await paired();
+      client.send({
+        kind: "set_workspace",
+        id: "w1",
+        root: path.join(fixture.root, "shortcut"),
+      });
+      const error = await client.next("error", (m) => m.id === "w1");
+      expect(error.code).toBe("workspace_refused");
+      expect(fixture.workspaces.root).toBe(fixture.root);
+    });
+
+    it("pushes a newly granted root to open sessions, with no reconnect", async () => {
+      // The bug this pins: granting a second directory does not move the active
+      // root, so an early version sent nothing and every connected popup kept
+      // showing one entry until it reconnected.
+      const client = await paired();
+      const ready = await client.next("ready");
+      expect(ready.roots).toHaveLength(2);
+
+      const extra = path.join(fixture.outside, "granted-later");
+      await fsp.mkdir(extra);
+      await fixture.workspaces.reload(fixture.root, [fixture.other, extra]);
+
+      const pushed = await client.next("workspace_changed");
+      expect(pushed.workspace).toBe(fixture.root);
+      expect(pushed.roots).toContain(extra);
+      // It is a list update, not a move — nothing about the active root changed.
+      expect(pushed.id).toBeUndefined();
+    });
+
+    it("rejects a set_workspace with no root", async () => {
+      const client = await paired();
+      client.send({ kind: "set_workspace", id: "w1" });
+      const error = await client.next("error", (m) => m.id === "w1");
+      expect(error.code).toBe("bad_request");
+    });
+
+    it("refuses set_workspace before the token is presented", async () => {
+      const client = await TestClient.open(port);
+      clients.push(client);
+      client.send({ kind: "set_workspace", id: "w1", root: fixture.other });
+      const error = await client.next("error");
+      expect(error.code).toBe("unauthorized");
+      expect(fixture.workspaces.root).toBe(fixture.root);
+    });
+
+    it("reads the new root on the next call, and the old one on a call already running", async () => {
+      await fsp.writeFile(path.join(fixture.other, "b.txt"), "other\n");
+      const client = await paired();
+
+      client.send({ kind: "set_workspace", id: "w1", root: fixture.other });
+      await client.next("workspace_changed", (m) => m.id === "w1");
+
+      client.send({ kind: "call_tool", id: "c1", name: "fs_read", args: { path: "b.txt" }, origin: ORIGIN });
+      const moved = await client.next("result", (m) => m.id === "c1");
+      expect(moved.result.content[0]?.text).toContain("other");
+
+      // `a.txt` lives in the old root and is now out of reach.
+      client.send({ kind: "call_tool", id: "c2", name: "fs_read", args: { path: "a.txt" }, origin: ORIGIN });
+      const gone = await client.next("error", (m) => m.id === "c2");
+      expect(gone.code).toBe("jail_violation");
+    });
+  });
+
+  it("runs an approved call against the root it was approved for, not the current one", async () => {
+    // The hazard a runtime switch introduces: the prompt said "write into
+    // project-a", and a switch while it was open must not land the write in
+    // project-b. The jail is pinned when the call arrives, before the wait.
+    const client = await paired();
+    client.send({
+      kind: "call_tool",
+      id: "c1",
+      name: "fs_write",
+      args: { path: "pinned.txt", content: "hello\n" },
+      origin: ORIGIN,
+    });
+    const prompt = await client.next("approval_request");
+    expect(prompt.summary).toContain("pinned.txt");
+
+    // Move the workspace while the human is still looking at the prompt.
+    client.send({ kind: "set_workspace", id: "w1", root: fixture.other });
+    await client.next("workspace_changed", (m) => m.id === "w1");
+
+    client.send({ kind: "approval_response", nonce: prompt.nonce, decision: "allow_once" });
+    await client.next("result", (m) => m.id === "c1");
+
+    await expect(fsp.readFile(path.join(fixture.root, "pinned.txt"), "utf8")).resolves.toBe("hello\n");
+    await expect(fsp.stat(path.join(fixture.other, "pinned.txt"))).rejects.toThrow();
+  });
+
+  it("records an allow_always against the root the prompt named", async () => {
+    const client = await paired();
+    client.send({
+      kind: "call_tool",
+      id: "c1",
+      name: "fs_write",
+      args: { path: "x.txt", content: "a" },
+      origin: ORIGIN,
+    });
+    const prompt = await client.next("approval_request");
+
+    client.send({ kind: "set_workspace", id: "w1", root: fixture.other });
+    await client.next("workspace_changed", (m) => m.id === "w1");
+    client.send({ kind: "approval_response", nonce: prompt.nonce, decision: "allow_always" });
+    await client.next("result", (m) => m.id === "c1");
+
+    // The standing rule belongs to the old root — a write in the new one still
+    // has to be asked about.
+    client.send({
+      kind: "call_tool",
+      id: "c2",
+      name: "fs_write",
+      args: { path: "y.txt", content: "b" },
+      origin: ORIGIN,
+    });
+    await client.next("approval_request", (m) => m.callId === "c2");
   });
 
   it("binds loopback only", () => {

@@ -35,12 +35,26 @@ export interface JailedPath {
   readonly display: string;
 }
 
+/**
+ * True when `candidate` (already symlink-resolved) is `root` or below it. The
+ * containment test, in one place, because both the jail and the set of
+ * grantable roots need exactly this question answered the same way.
+ */
+export function isWithin(root: string, candidate: string): boolean {
+  if (candidate === root) return true;
+  const rel = path.relative(root, candidate);
+  return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+}
+
 export class Workspace {
   private constructor(readonly root: string) {}
 
   /**
-   * `root` is resolved once at startup. Nothing at runtime can move it — the
-   * extension has no message that reaches this constructor.
+   * `root` is resolved here, and a `Workspace` never changes it afterwards.
+   * Switching roots at runtime means constructing a *new* Workspace through
+   * `WorkspaceManager`, which will only do so for a directory the user granted
+   * in the config file — there is still no message from the page that reaches
+   * this constructor with a root of its own choosing.
    */
   static async open(root: string): Promise<Workspace> {
     const abs = path.resolve(root);
@@ -57,9 +71,7 @@ export class Workspace {
 
   /** True when `candidate` (already symlink-resolved) is the root or below it. */
   contains(candidate: string): boolean {
-    if (candidate === this.root) return true;
-    const rel = path.relative(this.root, candidate);
-    return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+    return isWithin(this.root, candidate);
   }
 
   private toDisplay(real: string): string {

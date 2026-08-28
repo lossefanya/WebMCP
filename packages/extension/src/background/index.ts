@@ -19,8 +19,9 @@ import { clearPairing, loadPairing, savePairing } from "./store.js";
  * to the daemon", not "may decide what runs". Two rules keep that honest:
  *
  *  1. Messages from a content script are treated as coming from the page. Only
- *     the three `page_*` requests are accepted from there, and none of them can
- *     change pairing, approve a call, or name a workspace.
+ *     the `page_*` requests are accepted from there, and none of them can change
+ *     pairing, approve a call, or name a workspace — `ui_set_workspace` is
+ *     unreachable from a page for exactly that reason.
  *  2. The privileged `ui_*` requests are accepted only from an extension page.
  *     A content script asking to approve something is a bug or an attack; it is
  *     refused either way.
@@ -115,7 +116,8 @@ function isPopupRequest(message: unknown): message is PopupRequest {
     kind === "ui_reconnect" ||
     kind === "ui_approve" ||
     kind === "ui_inject_preamble" ||
-    kind === "ui_diagnose"
+    kind === "ui_diagnose" ||
+    kind === "ui_set_workspace"
   );
 }
 
@@ -220,6 +222,21 @@ async function handlePopupRequest(message: PopupRequest): Promise<PopupResponse>
       return { kind: "ui_ok" };
     }
 
+    // Only reachable from an extension page — a content script never gets past
+    // the `fromPage` branch above, so the page cannot ask for a move even
+    // though the daemon would refuse it anyway. Two independent locks, because
+    // this is the one control that touches what the tools may reach.
+    case "ui_set_workspace": {
+      const root = String(message.root);
+      if (!root) return { kind: "ui_error", message: "no workspace chosen" };
+      try {
+        await connection.setWorkspace(root);
+        return { kind: "ui_ok" };
+      } catch (err) {
+        return { kind: "ui_error", message: (err as Error).message };
+      }
+    }
+
     case "ui_diagnose": {
       const reply = await messageTab(message.tabId, { kind: "diagnose" });
       if (!reply.ok) return { kind: "ui_error", message: reply.error };
@@ -280,6 +297,7 @@ function snapshot(): UiState {
     paired: connection.state !== "idle",
     port: 0,
     workspace: connection.workspace,
+    workspaceRoots: connection.workspaceRoots,
     toolCount: connection.tools.length,
     servers: connection.servers,
     pendingApprovals: [...pendingApprovals.values()],

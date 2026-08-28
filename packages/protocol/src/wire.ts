@@ -51,12 +51,32 @@ export interface CancelMessage {
   id: string;
 }
 
+/**
+ * Move the workspace root to another directory *the user has already granted*.
+ *
+ * This is the one message that touches the security model, so read the limit
+ * carefully: it can only ever **select** among the roots the daemon already
+ * declared in `ready.roots`, or narrow into a subdirectory of one. It cannot
+ * name a new directory. The grantable set lives in the daemon's config file,
+ * which no page and no extension code can write, so nothing arriving over this
+ * socket can widen the grant — only move it within a set a human wrote down.
+ *
+ * The extension additionally refuses to send it on behalf of a content script,
+ * but that gate is not load-bearing: the daemon re-checks independently.
+ */
+export interface SetWorkspaceMessage {
+  kind: "set_workspace";
+  id: string;
+  root: string;
+}
+
 export type ClientMessage =
   | HelloMessage
   | ListToolsMessage
   | CallToolMessage
   | ApprovalResponseMessage
-  | CancelMessage;
+  | CancelMessage
+  | SetWorkspaceMessage;
 
 /* ------------------------------------------------------------------ */
 /* daemon -> extension                                                */
@@ -66,8 +86,27 @@ export interface ReadyMessage {
   kind: "ready";
   version: number;
   workspace: string;
+  /**
+   * Roots the daemon will accept in `set_workspace`, the active one included.
+   * Declared in the daemon's config file — this is a report of a decision the
+   * user already made on disk, never a menu the extension can add to.
+   */
+  roots: string[];
   /** Servers the daemon tried to reach, with live status. */
   servers: ServerStatus[];
+}
+
+/**
+ * The workspace root moved. Sent to every session, not just the one that asked,
+ * because a stale root in another tab's popup is a lie about what the tools can
+ * reach.
+ */
+export interface WorkspaceChangedMessage {
+  kind: "workspace_changed";
+  /** Present when this answers a `set_workspace`; absent when the daemon moved itself. */
+  id?: string;
+  workspace: string;
+  roots: string[];
 }
 
 export interface ServerStatus {
@@ -131,6 +170,7 @@ export type ErrorCode =
   | "unknown_tool"
   | "denied"
   | "jail_violation"
+  | "workspace_refused"
   | "timeout"
   | "server_unavailable"
   | "internal";
@@ -139,6 +179,7 @@ export type ServerToClientMessage =
   | ReadyMessage
   | ToolsMessage
   | ToolsChangedMessage
+  | WorkspaceChangedMessage
   | ResultMessage
   | ApprovalRequestMessage
   | ErrorMessage;
@@ -222,13 +263,16 @@ export type PopupRequest =
   | { kind: "ui_reconnect" }
   | { kind: "ui_approve"; nonce: string; decision: "allow_once" | "allow_always" | "deny" }
   | { kind: "ui_inject_preamble"; tabId: number }
-  | { kind: "ui_diagnose"; tabId: number };
+  | { kind: "ui_diagnose"; tabId: number }
+  | { kind: "ui_set_workspace"; root: string };
 
 export interface UiState {
   connected: boolean;
   paired: boolean;
   port: number;
   workspace: string | null;
+  /** Roots the daemon offers to switch between. One entry means no choice to make. */
+  workspaceRoots: string[];
   toolCount: number;
   servers: ServerStatus[];
   pendingApprovals: ApprovalRequestMessage[];

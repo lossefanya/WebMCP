@@ -5,6 +5,7 @@ import { DEFAULT_EXEC_ALLOW, type Config } from "../src/config.js";
 import { Workspace } from "../src/jail.js";
 import type { Logger } from "../src/log.js";
 import type { ToolContext } from "../src/tools/types.js";
+import { WorkspaceManager } from "../src/workspace.js";
 
 /**
  * A real temp directory, not a mock. The jail's whole job is to be right about
@@ -13,19 +14,28 @@ import type { ToolContext } from "../src/tools/types.js";
 export async function tempWorkspace(): Promise<{
   root: string;
   outside: string;
+  /** A second real directory, granted alongside `root`, for switch tests. */
+  other: string;
   workspace: Workspace;
+  workspaces: WorkspaceManager;
   cleanup(): Promise<void>;
 }> {
   const base = await fsp.mkdtemp(path.join(await fsp.realpath(os.tmpdir()), "webmcp-test-"));
   const root = path.join(base, "workspace");
   const outside = path.join(base, "outside");
+  const other = path.join(base, "other");
   await fsp.mkdir(root);
   await fsp.mkdir(outside);
+  await fsp.mkdir(other);
   const workspace = await Workspace.open(root);
+  // `outside` is deliberately *not* granted — it is what a refused switch aims at.
+  const workspaces = await WorkspaceManager.open(root, [other], silentLogger);
   return {
     root: workspace.root,
     outside,
+    other: await fsp.realpath(other),
     workspace,
+    workspaces,
     cleanup: () => fsp.rm(base, { recursive: true, force: true }),
   };
 }
@@ -33,6 +43,7 @@ export async function tempWorkspace(): Promise<{
 export function testConfig(root: string, overrides: Partial<Config> = {}): Config {
   return {
     workspace: root,
+    workspaces: [],
     port: 0,
     exec: { allow: [...DEFAULT_EXEC_ALLOW], timeoutMs: 5_000, maxOutputBytes: 8_192 },
     limits: {

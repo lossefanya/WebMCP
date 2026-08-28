@@ -2,6 +2,35 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Keep README.md current — every time
+
+`README.md` is the user-facing half of the documentation and it goes stale silently, because nothing
+compiles it and no test fails when it lies. Two claims drifted before anyone noticed: it listed three
+supported hosts after gemini.google.com shipped with an adapter, a manifest entry and a fixture, and
+it said the daemon "prints a pairing token on first run" long after that was changed to every run.
+
+So: **any change a user could notice belongs in `README.md` in the same pass as the code.** Not a
+follow-up, not "later" — the same change. Concretely, update it when you touch
+
+- a CLI flag, its name, or its default (`--set-workspace`, `--hide-token`, `--config`);
+- a config key, its shape, or its default (`workspace`, `workspaces`, `port`, `exec.allow`, `limits`);
+- where anything on disk lives (the `.webmcp/` directory, the token, the allowlist);
+- what needs a restart versus what reloads live;
+- the set of supported hosts, or anything visible in the popup;
+- any security-relevant behaviour a user relies on — what prompts, what is auto-approved, what the
+  jail refuses, what a standing "always allow" covers.
+
+Two rules that come from getting this wrong:
+
+- **Verify claims against the code, not against memory.** Both stale lines above read as plausible.
+  Grep for the constant, or run the thing — the empty-`exec.allow` behaviour and the documented config
+  example were both checked by booting a daemon, and that is the standard.
+- **Explain every key you show.** A config example with keys nobody defines invites a reader to guess.
+
+`README.md` is the overview and stays short: it defers to this file for architecture, invariants and
+the full command reference. When a detail is too deep for it, put the detail here and leave the
+README a correct one-liner that points across — never a wrong one, and never silence.
+
 ## Status
 
 First implementation has landed. Both halves build, and the daemon has a test suite covering the
@@ -14,8 +43,8 @@ Layout — an npm workspace, Node.js + TypeScript throughout:
   daemon's suite despite only the extension using it.
 - `packages/daemon` — `cli.ts` → `config` → `jail` → `registry` (`tools/fs`, `tools/exec`,
   `mcp/manager`) → `policy` → `server`. The only trust boundary.
-- `packages/extension` — `background/` (socket + token), `content/` (DOM + adapters), `ui/` (pairing
-  and approval UI).
+- `packages/extension` — `background/` (socket + token), `content/` (DOM + adapters), `ui/` (pairing,
+  approval UI and the workspace picker).
 
 Adapter status — **all four hosts confirmed at both ends**, each pinned by a verbatim DOM capture in
 `packages/extension/test/fixtures/`. When a host breaks, capture the new DOM into a fixture *first*;
@@ -74,6 +103,8 @@ the model reads can prompt-inject that text. A malicious page can also open its 
 
 - **All authorization lives in the daemon.** The extension is a transport, never a gatekeeper. Never
   let a message from the page widen the workspace root, add an allowlist entry, or skip approval.
+  The workspace root *moves* at runtime (see below) and this rule still holds exactly as written:
+  moving is a selection from a list the user wrote on disk, never a way to name somewhere new.
 - **The daemon authenticates its client.** Origin headers on a WebSocket are not sufficient — pair
   the extension with the daemon via a shared token held in `chrome.storage` and required on connect.
 - The daemon binds `127.0.0.1` only, never `0.0.0.0`.
@@ -92,6 +123,49 @@ The whole product promise is "it can only touch the directory I named." Enforce 
   specific shape. Reads may be auto-approved inside the jail.
 - Downstream MCP servers are outside the jail by nature (Notion, Figma reach the network). Treat
   enabling one as its own consent decision, separate from the filesystem grant.
+
+### Moving the workspace without restarting
+
+`packages/daemon/src/workspace.ts` owns the live root. A `Workspace` is still immutable — a jail that
+can be moved by whoever it contains is not one — so a switch builds a new one and swaps the
+reference. Two routes, and both of them route the *grant* through the config file, which is the only
+channel the browser cannot reach:
+
+- `--set-workspace <dir>` writes `workspace` and unions `<dir>` into `workspaces`, then exits. The
+  running daemon notices via a config watcher (and `SIGHUP`) and moves. This is how a **new**
+  directory is granted.
+- `set_workspace` on the wire, reachable only from the popup's picker, **selects** among the roots
+  already in `workspaces`. It cannot add one.
+
+Rules the implementation settled here, none of them optional:
+
+- **A call is pinned to the jail it arrived under, before the approval wait.** `server.ts` reads
+  `workspaces.current` once when the call is claimed and passes that `Workspace` through `validate`,
+  `Policy.decide`, `alwaysLabel`, `allowAlways` and `registry.call`. Reading the live root at
+  execution time instead means a switch while a prompt is open redirects the write: the human
+  approved "write `config.json` in *project-a*" and it lands in *project-b*. A regression test pins
+  this, and it fails if the pin is removed.
+- **Standing allows are keyed by root.** `scopedKey(root, allowKey(...))`. The button has always read
+  "Always allow `git` in *project*", so carrying the grant across a switch would be the daemon doing
+  something other than what was clicked. Rules written before scoping carry no root, so they are
+  dropped on load rather than guessed at — one extra prompt beats a grant applied to a directory
+  nobody named.
+- **Narrowing is free, widening is refused.** A subdirectory of a granted root is strictly less reach,
+  so it needs no separate grant. The *parent* of a granted root is a widening and is refused, which is
+  the case worth having a test for.
+- **Resolve before comparing, exactly as the jail does.** `switchTo` realpaths the request first; a
+  symlink inside a granted root pointing at an ungranted directory would otherwise pass a string
+  check.
+- **A config reload moves the root only when `workspace` itself changed.** The manager remembers the
+  last value it read. Otherwise touching the file to add an MCP server yanks the user out of a root
+  they picked in the popup. For the same reason `--workspace` is dropped on reload: it says where to
+  *start*, not where to stay, and leaving it in would make a daemon started the documented way
+  unmovable.
+- **The watcher watches the directory, not the file.** Editors and `writeFile` replace the config
+  rather than truncating it, so a watch bound to the old inode goes silent forever. A half-saved file
+  parses as garbage; keeping the current config and waiting for the next write is right.
+- **A move is broadcast to every session, not just the asker.** A stale root in a second tab's popup
+  is a lie about what the tools can reach.
 
 Rules the implementation settled that were not obvious up front:
 
@@ -292,14 +366,31 @@ node packages/daemon/dist/cli.js --print-token        # print the token and exit
 node packages/daemon/dist/cli.js --help
 ```
 
+Changing the workspace of a daemon that is already running — no restart, no re-pairing:
+
+```bash
+node packages/daemon/dist/cli.js --set-workspace ~/code/other   # grants it and switches
+kill -HUP $(pgrep -f webmcp-daemon)                             # or just re-read the config
+```
+
+Once two roots are granted, the popup's picker moves between them. Either way the chat still holds a
+preamble naming the old root, so re-inject the tool instructions after a switch — the popup says so.
+
 The startup banner prints the pairing token every time, not only on first run —
 needing a second command to go and fetch it was pure friction, and this terminal
 is already where the audit log goes. `--hide-token` suppresses it for
-screensharing. The token is also just a file: `cat ~/.webmcp/token`.
+screensharing. The token is also just a file: `cat .webmcp/token`.
 
-Config lives at `~/.webmcp/config.json` (override with `--config`). `mcpServers` takes
-`claude_desktop_config.json` blocks verbatim; `workspace`, `port`, `exec.allow` and `limits` are
-WebMCP's own. The pairing token and the standing-approval allowlist sit next to it as `token` and
+Config lives at `.webmcp/config.json` in the **project root** — the npm workspace root, found by
+walking up from the daemon module rather than from `cwd`, so where you were standing when you typed
+the command cannot change which config is read. Override with `--config`. Deliberately not `$HOME`:
+config, token and allowlist are one visible directory beside the code that the user can inspect and
+delete, instead of state hiding elsewhere on the disk. `.gitignore` already covers `.webmcp/`, and
+the directory is created `0700` with every file inside it `0600`. `mcpServers` takes
+`claude_desktop_config.json` blocks verbatim; `workspace`, `workspaces`, `port`, `exec.allow` and
+`limits` are WebMCP's own. `workspaces` is the set the root may be switched to at runtime and is the
+consent decision behind the popup's picker — only the workspace fields are applied on reload, since
+ports, exec allowlists and MCP blocks are wired into objects built at startup. The pairing token and the standing-approval allowlist sit next to it as `token` and
 `allowlist.json`, both `0600`.
 
 Driving the daemon by hand, without a browser — the fastest way to tell "the daemon is broken" apart
@@ -307,6 +398,8 @@ from "the content script cannot find the DOM":
 
 ```bash
 node scripts/probe.mjs tools
+node scripts/probe.mjs roots
+node scripts/probe.mjs workspace ~/code/other
 node scripts/probe.mjs call fs_read '{"path":"README.md"}'
 node scripts/probe.mjs --allow call exec_run '{"command":"git","args":["status"]}'
 node scripts/probe.mjs --port 8792 --deny call fs_write '{"path":"x","content":"y"}'

@@ -37,10 +37,65 @@ async function ask(request: PopupRequest): Promise<PopupResponse> {
   }
 }
 
-function showError(message: string | null): void {
-  errorLine.textContent = message ?? "";
-  errorLine.hidden = message === null;
+/**
+ * The message line, which has two kinds of content with different lifetimes.
+ *
+ * *Ambient* text describes a standing condition — the socket is down, the
+ * content script complained — and is recomputed from state on every redraw, so
+ * it comes and goes with the condition itself.
+ *
+ * A *flash* is the answer to something the user just did: a refusal, or a
+ * "that worked, now do this". It has to outlive the redraw, and that is the
+ * whole reason this is not one variable. `render()` runs once a second to keep
+ * the approval countdown moving, and it used to end by rewriting this line
+ * unconditionally — so every message the user actually needed to read was wiped
+ * within a second of appearing.
+ *
+ * A flash therefore wins over ambient text, and it stays until the user clicks
+ * it away or another flash replaces it. No timeout: a message that removes
+ * itself is a message that can be missed entirely, and the popup is often not
+ * the window being looked at when it appears.
+ *
+ * Ambient text is deliberately *not* dismissible — it describes a live
+ * condition, so clearing it would only last until the next redraw a second
+ * later, which reads as a broken control. Only a flash gets the pointer cursor.
+ */
+interface Flash {
+  text: string;
+  tone: "error" | "info";
 }
+
+let flash: Flash | null = null;
+let ambient: string | null = null;
+
+function paintMessage(): void {
+  const text = flash?.text ?? ambient;
+  errorLine.textContent = text ?? "";
+  errorLine.hidden = text === null;
+  errorLine.className = flash?.tone === "info" ? "notice" : "error";
+  if (flash !== null) errorLine.classList.add("dismissible");
+  errorLine.title = flash === null ? "" : "Click to dismiss";
+}
+
+/** Something the user just did failed. Stays until dismissed. */
+function showError(message: string | null): void {
+  flash = message === null ? null : { text: message, tone: "error" };
+  paintMessage();
+}
+
+/** Something the user just did worked, and there is a next step. */
+function showNotice(message: string): void {
+  flash = { text: message, tone: "info" };
+  paintMessage();
+}
+
+// Dismissing matters because the line is also where the *next* message will
+// appear — a stale one sitting there makes a new one easy to miss.
+errorLine.addEventListener("click", () => {
+  if (flash === null) return;
+  flash = null;
+  paintMessage();
+});
 
 async function refresh(): Promise<void> {
   const reply = await ask({ kind: "ui_get_state" });
@@ -65,6 +120,7 @@ function render(state: UiState): void {
 
   if (state.paired) {
     el("workspace").textContent = state.workspace ?? (state.connected ? "—" : "not connected");
+    renderSwitcher(state);
     el("tools").textContent = String(state.toolCount);
     el("servers").textContent = state.servers.length
       ? state.servers
@@ -77,7 +133,60 @@ function render(state: UiState): void {
 
   // A DOM-side failure is the more actionable message when there is one: the
   // socket being fine is not much comfort if the page never got the preamble.
-  showError(state.pageError ?? (state.connected || !state.paired ? null : state.lastError));
+  ambient = state.pageError ?? (state.connected || !state.paired ? null : state.lastError);
+  paintMessage();
+}
+
+/**
+ * The workspace picker.
+ *
+ * The options come from the daemon, which built them from its config file — the
+ * popup neither knows nor decides which directories are allowed, it just draws
+ * the list it was handed.
+ *
+ * Shown even when there is only one root. Hiding it until a second appeared was
+ * worse: the feature was invisible to anyone who had not already used it, and
+ * the hint naming `--set-workspace` — the only way to add a second — was hidden
+ * along with it, so the control only showed up once you no longer needed telling.
+ *
+ * Rebuilt only when the list actually changes: this runs once a second for the
+ * approval countdown, and resetting a <select> under someone mid-choice would
+ * make it unusable.
+ */
+let renderedRoots = "";
+
+function renderSwitcher(state: UiState): void {
+  const roots = state.workspaceRoots;
+  // Nothing at all to draw only when the daemon has told us nothing yet.
+  el("switcher").hidden = roots.length === 0;
+  if (roots.length === 0) {
+    renderedRoots = "";
+    return;
+  }
+
+  const signature = roots.join("\u0000");
+  const pick = el<HTMLSelectElement>("workspace-pick");
+  if (signature !== renderedRoots) {
+    renderedRoots = signature;
+    pick.textContent = "";
+    for (const root of roots) {
+      const option = document.createElement("option");
+      option.value = root;
+      // A path is daemon-supplied, but it is still text, never markup.
+      option.textContent = root;
+      pick.append(option);
+    }
+  }
+  if (state.workspace && pick.value !== state.workspace) pick.value = state.workspace;
+
+  // With the socket down the roots on screen are the last ones the daemon
+  // reported, and a switch would only produce "not connected". Offering a
+  // control that cannot work is worse than plainly greying it out.
+  // With one root there is nowhere to go, so the control is visible but inert —
+  // it is there to say the feature exists and how to feed it.
+  const nowhereToGo = roots.length < 2;
+  pick.disabled = !state.connected || nowhereToGo;
+  el<HTMLButtonElement>("do-switch").disabled = !state.connected || nowhereToGo;
 }
 
 function renderApprovals(requests: ApprovalRequestMessage[]): void {
@@ -157,6 +266,20 @@ el("unpair").addEventListener("click", async () => {
 el("reconnect").addEventListener("click", async () => {
   await ask({ kind: "ui_reconnect" });
   setTimeout(() => void refresh(), 400);
+});
+
+el("do-switch").addEventListener("click", async () => {
+  const root = el<HTMLSelectElement>("workspace-pick").value;
+  const reply = await ask({ kind: "ui_set_workspace", root });
+  if (reply.kind === "ui_error") {
+    showError(reply.message);
+    return;
+  }
+  await refresh();
+  // The conversation still holds a preamble naming the old root, and every
+  // result already pasted into it came from there. Saying so is the difference
+  // between a switch that works and a model confidently reading the wrong tree.
+  showNotice("Workspace changed — inject the tool instructions again so the chat knows.");
 });
 
 el("diagnose").addEventListener("click", async () => {

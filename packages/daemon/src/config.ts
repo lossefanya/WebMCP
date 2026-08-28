@@ -1,6 +1,8 @@
+import { readFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { DEFAULT_PORT } from "@webmcp/protocol";
 
 /**
@@ -36,6 +38,16 @@ export interface Limits {
 
 export interface Config {
   workspace: string;
+  /**
+   * Roots the daemon may be switched to at runtime, beyond the active one.
+   *
+   * This list *is* the consent decision. It lives in a file only the user can
+   * write, which is what makes a runtime switch a selection rather than a
+   * widening — see `WorkspaceManager`. Adding a root is a terminal action
+   * (`--set-workspace`, or an editor); it is deliberately not something the
+   * browser half can do.
+   */
+  workspaces: string[];
   port: number;
   exec: ExecConfig;
   limits: Limits;
@@ -75,8 +87,57 @@ const DEFAULTS = {
   },
 } as const;
 
+/**
+ * The project directory the daemon was built in, found by walking up from this
+ * module to the npm workspace root.
+ *
+ * Resolved from the module's own location rather than `process.cwd()`, because
+ * where you happened to be standing when you typed the command should not
+ * change which config the daemon reads. It works the same from `src/` under
+ * vitest and from `dist/` in a real run, since both sit under the same root.
+ *
+ * The fallback, for a daemon installed outside a workspace, is the nearest
+ * enclosing package — never the home directory, so state stays with the
+ * install instead of appearing somewhere the user did not choose.
+ */
+let cachedRoot: string | undefined;
+
+export function projectRoot(): string {
+  if (cachedRoot !== undefined) return cachedRoot;
+
+  let dir = path.dirname(fileURLToPath(import.meta.url));
+  let nearestPackage: string | undefined;
+
+  for (let hops = 0; hops < 8; hops++) {
+    try {
+      const pkg = JSON.parse(readFileSync(path.join(dir, "package.json"), "utf8")) as {
+        workspaces?: unknown;
+      };
+      nearestPackage ??= dir;
+      // The workspace root is the repo root — the directory holding `packages/`.
+      if (pkg.workspaces !== undefined) {
+        cachedRoot = dir;
+        return dir;
+      }
+    } catch {
+      // No package.json here, or an unreadable one. Keep walking.
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+
+  cachedRoot = nearestPackage ?? path.dirname(fileURLToPath(import.meta.url));
+  return cachedRoot;
+}
+
+/**
+ * Config, pairing token and standing allowlist all live in one directory, next
+ * to the project rather than in `$HOME` — three files in one place the user can
+ * see and delete, instead of state hiding somewhere else on the disk.
+ */
 export function defaultConfigPath(): string {
-  return path.join(os.homedir(), ".webmcp", "config.json");
+  return path.join(projectRoot(), ".webmcp", "config.json");
 }
 
 export function expandHome(p: string): string {
@@ -91,14 +152,52 @@ export interface ConfigOverrides {
   configPath?: string;
 }
 
+export function configPathFor(overrides: ConfigOverrides = {}): string {
+  return overrides.configPath ? expandHome(overrides.configPath) : defaultConfigPath();
+}
+
+/**
+ * Point the config file at a new root, and grant it.
+ *
+ * Both halves matter. `workspace` is where the daemon works; `workspaces` is
+ * the set it may be switched back to from the popup later. Writing from the
+ * terminal is what makes this a grant at all — it is the one channel the
+ * browser cannot reach.
+ *
+ * The file is rewritten rather than patched in place, so a hand-written config
+ * loses its comments. That is why it round-trips through `JSON.parse` of the
+ * existing file: every key the user set is preserved, only these two change.
+ */
+export async function grantWorkspace(
+  root: string,
+  overrides: ConfigOverrides = {},
+): Promise<{ file: string; workspace: string; workspaces: string[] }> {
+  const file = configPathFor(overrides);
+  const resolved = await fs.realpath(path.resolve(expandHome(root)));
+  const st = await fs.stat(resolved);
+  if (!st.isDirectory()) throw new Error(`not a directory: ${resolved}`);
+
+  const raw = await readJsonIfPresent(file);
+  const previous = (asStringArray(raw.workspaces) ?? []).map(expandHome);
+  const previousActive = asString(raw.workspace);
+  const workspaces = [...previous];
+  for (const keep of [previousActive, resolved]) {
+    if (keep && !workspaces.includes(keep)) workspaces.push(keep);
+  }
+
+  const next = { ...raw, workspace: resolved, workspaces };
+  await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+  await fs.writeFile(file, `${JSON.stringify(next, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  return { file, workspace: resolved, workspaces };
+}
+
 /**
  * Where the token and allowlist live, resolved without reading or validating
  * the config. Printing the pairing token has nothing to do with the workspace
  * grant, so it must not be blocked by a missing one.
  */
 export function stateDirFor(overrides: ConfigOverrides = {}): string {
-  const configPath = overrides.configPath ? expandHome(overrides.configPath) : defaultConfigPath();
-  return path.dirname(configPath);
+  return path.dirname(configPathFor(overrides));
 }
 
 /**
@@ -107,10 +206,11 @@ export function stateDirFor(overrides: ConfigOverrides = {}): string {
  * no safe default, so it is never inferred from `cwd`.
  */
 export async function loadConfig(overrides: ConfigOverrides = {}): Promise<Config> {
-  const configPath = overrides.configPath ? expandHome(overrides.configPath) : defaultConfigPath();
+  const configPath = configPathFor(overrides);
   const raw = await readJsonIfPresent(configPath);
 
-  const workspaceRaw = overrides.workspace ?? asString(raw.workspace);
+  const declared = (asStringArray(raw.workspaces) ?? []).map(expandHome);
+  const workspaceRaw = overrides.workspace ?? asString(raw.workspace) ?? declared[0];
   if (!workspaceRaw) {
     throw new Error(
       `no workspace configured — pass --workspace <dir> or set "workspace" in ${configPath}`,
@@ -122,6 +222,7 @@ export async function loadConfig(overrides: ConfigOverrides = {}): Promise<Confi
 
   return {
     workspace: expandHome(workspaceRaw),
+    workspaces: declared,
     port: overrides.port ?? asNumber(raw.port) ?? DEFAULTS.port,
     exec: {
       allow: asStringArray(execRaw.allow) ?? [...DEFAULTS.exec.allow],

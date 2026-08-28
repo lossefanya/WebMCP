@@ -1,7 +1,16 @@
 #!/usr/bin/env node
-import { loadConfig, defaultConfigPath, stateDirFor, type ConfigOverrides } from "./config.js";
-import { Workspace } from "./jail.js";
-import { createLogger } from "./log.js";
+import * as fsSync from "node:fs";
+import * as path from "node:path";
+import {
+  configPathFor,
+  defaultConfigPath,
+  grantWorkspace,
+  loadConfig,
+  stateDirFor,
+  type ConfigOverrides,
+} from "./config.js";
+import { WorkspaceManager } from "./workspace.js";
+import { createLogger, type Logger } from "./log.js";
 import { McpManager } from "./mcp/manager.js";
 import { Policy } from "./policy.js";
 import { Registry } from "./registry.js";
@@ -17,6 +26,10 @@ Options
                           unless "workspace" is set in the config file.
   -p, --port <n>          Loopback port to listen on.
   -c, --config <file>     Config file. Default ${defaultConfigPath()}
+      --set-workspace <dir>
+                          Point the config at <dir>, add it to the switchable
+                          set, and exit. A daemon that is already running picks
+                          the change up without a restart.
       --print-token       Print the pairing token and exit without starting.
       --hide-token        Do not print the token on startup (for screensharing).
       --verbose           Log connection and MCP detail to stderr.
@@ -24,6 +37,13 @@ Options
 
 The daemon listens on 127.0.0.1 only, and every connection must present the
 pairing token. Paste the token into the extension popup once to pair.
+
+The workspace root can move while the daemon runs, two ways, and both of them
+go through the config file — which is what keeps a runtime switch a choice
+between directories a human wrote down rather than a way to widen the grant:
+
+  --set-workspace <dir>   from a terminal; grants <dir> and switches to it
+  the popup's picker      switches between roots already in "workspaces"
 `;
 
 interface Args extends ConfigOverrides {
@@ -31,6 +51,7 @@ interface Args extends ConfigOverrides {
   printToken: boolean;
   hideToken: boolean;
   verbose: boolean;
+  setWorkspace?: string;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -61,6 +82,9 @@ function parseArgs(argv: string[]): Args {
       case "-c":
       case "--config":
         out.configPath = next();
+        break;
+      case "--set-workspace":
+        out.setWorkspace = next();
         break;
       case "--print-token":
         out.printToken = true;
@@ -94,22 +118,40 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Also before `loadConfig`: this is how the *first* workspace gets configured,
+  // so it cannot require one to already be there.
+  if (args.setWorkspace !== undefined) {
+    const granted = await grantWorkspace(args.setWorkspace, args);
+    process.stdout.write(
+      [
+        `workspace:  ${granted.workspace}`,
+        `granted:    ${granted.workspaces.join(", ")}`,
+        `written to  ${granted.file}`,
+        ``,
+        `A running daemon picks this up within a second; there is no need to restart it.`,
+        ``,
+      ].join("\n"),
+    );
+    return;
+  }
+
   const config = await loadConfig(args);
   const log = createLogger(args.verbose);
   const token = await loadOrCreateToken(config.stateDir);
 
   // Resolving the workspace before anything listens means a typo'd path fails
   // now, not on the first tool call.
-  const workspace = await Workspace.open(config.workspace);
+  const workspaces = await WorkspaceManager.open(config.workspace, config.workspaces, log);
 
-  const policy = new Policy({ ...config, workspace: workspace.root }, log);
+  const policy = new Policy(config, log, workspaces);
   await policy.load();
 
   const mcp = new McpManager(config, log);
-  const registry = new Registry(workspace, { ...config, workspace: workspace.root }, mcp, log);
+  const registry = new Registry(config, mcp, log);
 
   const server = new DaemonServer({
-    config: { ...config, workspace: workspace.root },
+    config,
+    workspaces,
     registry,
     policy,
     mcp,
@@ -120,9 +162,14 @@ async function main(): Promise<void> {
   const port = await server.listen();
   mcp.start();
 
+  const stopWatching = watchConfig(args, log, () => reloadNow(args, workspaces, log));
+
   const banner = [
     `webmcp daemon listening on ws://127.0.0.1:${port}`,
-    `workspace: ${workspace.root}`,
+    `workspace: ${workspaces.root}`,
+    workspaces.roots().length > 1
+      ? `switchable: ${workspaces.roots().slice(1).join(", ")}`
+      : `switchable: none — grant more with --set-workspace <dir>`,
     `tools:     ${registry.list().length} built-in`,
     Object.keys(config.mcpServers).length
       ? `mcp:       ${Object.keys(config.mcpServers).join(", ")} (connecting)`
@@ -148,14 +195,87 @@ async function main(): Promise<void> {
   }
   process.stdout.write(`${banner.join("\n")}\n`);
 
+  process.on("SIGHUP", () => {
+    log.info("SIGHUP — re-reading config");
+    void reloadNow(args, workspaces, log);
+  });
+
+
   const shutdown = async (signal: string) => {
     process.stdout.write(`\n${signal} — shutting down\n`);
+    stopWatching();
     await server.close();
     await mcp.close();
     process.exit(0);
   };
   process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
+}
+
+/**
+ * Notice the config file changing, so `--set-workspace` in another terminal
+ * reaches a daemon that is already running.
+ *
+ * Watches the *directory*, not the file: editors and `writeFile` alike replace
+ * the file rather than truncating it, and a watch bound to the old inode then
+ * goes silent forever. The debounce collapses the write/rename burst a single
+ * save produces into one reload.
+ */
+function watchConfig(overrides: ConfigOverrides, log: Logger, apply: () => Promise<void>): () => void {
+  const file = configPathFor(overrides);
+  const dir = path.dirname(file);
+  let timer: NodeJS.Timeout | undefined;
+  let watcher: fsSync.FSWatcher;
+
+  try {
+    watcher = fsSync.watch(dir, { persistent: false }, (_event, name) => {
+      if (name !== null && name !== path.basename(file)) return;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        // A half-saved file parses as garbage. `apply` keeps the current config
+        // and waits for the next write: refusing to serve because someone is
+        // mid-edit would be a worse failure than a stale root.
+        void apply();
+      }, 150);
+      timer.unref?.();
+    });
+  } catch (err) {
+    log.warn(`not watching ${file} for changes: ${(err as Error).message}`);
+    return () => {};
+  }
+
+  return () => {
+    if (timer) clearTimeout(timer);
+    watcher.close();
+  };
+}
+
+/**
+ * Re-read the config and apply the parts that can move.
+ *
+ * `--workspace` is deliberately dropped here. It says where to *start*, not
+ * where to stay: leaving it in would mean a daemon launched the documented way
+ * (`npm run daemon -- --workspace ~/code/thing`) could never be moved by
+ * `--set-workspace`, which is most of the point. The flag still decides the
+ * root at startup and still seeds the grantable set.
+ *
+ * Only the workspace is applied. Ports, exec allowlists and MCP server blocks
+ * are wired into objects built at startup, and pretending to reload them would
+ * be worse than saying plainly that they need a restart.
+ */
+async function reloadNow(
+  overrides: ConfigOverrides,
+  workspaces: WorkspaceManager,
+  log: Logger,
+): Promise<void> {
+  try {
+    const next = await loadConfig({ ...overrides, workspace: undefined });
+    await workspaces.reload(next.workspace, next.workspaces);
+  } catch (err) {
+    // Reached when the config names no workspace at all, which is normal for a
+    // daemon started purely from flags. Nothing to apply is not a failure.
+    log.info(`config reload had nothing to apply: ${(err as Error).message}`);
+  }
 }
 
 main().catch((err: unknown) => {

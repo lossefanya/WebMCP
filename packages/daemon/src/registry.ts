@@ -17,7 +17,6 @@ export class Registry {
   private readonly builtins = new Map<string, Tool>();
 
   constructor(
-    private readonly workspace: Workspace,
     private readonly config: Config,
     private readonly mcp: McpManager,
     private readonly log: Logger,
@@ -60,23 +59,31 @@ export class Registry {
    * is asked. Unknown downstream tools are the only thing checked here for
    * proxied calls — the daemon does not re-implement each server's schema.
    */
-  validate(name: string, args: Record<string, unknown>): void {
+  validate(name: string, args: Record<string, unknown>, workspace: Workspace): void {
     const builtin = this.builtins.get(name);
     if (builtin?.validate) {
-      builtin.validate(args, { workspace: this.workspace, config: this.config });
+      builtin.validate(args, { workspace, config: this.config });
     }
   }
 
+  /**
+   * `workspace` is passed in rather than read from the live manager, and that
+   * is load-bearing. The root can move while a call sits in front of a human,
+   * so the jail a call runs under has to be the one it was validated and
+   * approved under — otherwise a user approving "write config.json in
+   * project-a" gets it written into project-b.
+   */
   async call(
     name: string,
     args: Record<string, unknown>,
     origin: string,
     signal: AbortSignal,
+    workspace: Workspace,
   ): Promise<ToolResult> {
     const builtin = this.builtins.get(name);
     if (builtin) {
       const ctx: ToolContext = {
-        workspace: this.workspace,
+        workspace,
         config: this.config,
         origin,
         signal,

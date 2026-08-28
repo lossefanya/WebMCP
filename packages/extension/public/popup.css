@@ -80,7 +80,22 @@ input {
   color: inherit;
   font: inherit;
 }
-input:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+select {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: inherit;
+  font: inherit;
+}
+select + button { margin-top: 6px; }
+input:focus-visible, button:focus-visible, select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+#switcher { margin: 10px 0; }
 
 .hint { margin: 0 0 6px; color: var(--muted); }
 code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
@@ -110,7 +125,14 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 1
 .approval .row { display: flex; gap: 6px; }
 .approval .row button { margin-top: 0; }
 
-.error { color: var(--danger); margin: 10px 0 0; }
+/* One line, two tones. A confirmation is not a failure — styling it like one
+   teaches the user to ignore the line that also carries real errors. */
+.error, .notice { margin: 10px 0 0; }
+.error { color: var(--danger); }
+.notice { color: var(--accent); }
+/* Only a dismissible message invites a click. Ambient text describing a live
+   condition would just come back on the next redraw. */
+.dismissible { cursor: pointer; }
 
 #report {
   margin: 8px 0 0;

@@ -19,7 +19,7 @@ describe("Registry", () => {
   const build = (overrides = {}) => {
     const config = testConfig(fixture.root, overrides);
     mcp = new McpManager(config, silentLogger);
-    return { config, registry: new Registry(fixture.workspace, config, mcp, silentLogger), mcp };
+    return { config, registry: new Registry(config, mcp, silentLogger), mcp };
   };
 
   it("lists the built-in tools first", () => {
@@ -43,7 +43,7 @@ describe("Registry", () => {
   it("reports an unknown tool as unknown rather than throwing something opaque", async () => {
     const { registry } = build();
     await expect(
-      registry.call("nope__missing", {}, "test", new AbortController().signal),
+      registry.call("nope__missing", {}, "test", new AbortController().signal, fixture.workspace),
     ).rejects.toThrow(/unknown tool/);
   });
 
@@ -83,7 +83,7 @@ describe("MCP aggregation", () => {
       },
     });
     mcp = new McpManager(config, silentLogger);
-    const registry = new Registry(fixture.workspace, config, mcp, silentLogger);
+    const registry = new Registry(config, mcp, silentLogger);
 
     mcp.start();
     // The local tools are listable straight away — no waiting on the server.

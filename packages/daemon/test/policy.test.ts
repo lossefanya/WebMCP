@@ -2,7 +2,7 @@ import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { ToolDescriptor } from "@webmcp/protocol";
-import { Policy, allowKey } from "../src/policy.js";
+import { Policy, allowKey, scopedKey } from "../src/policy.js";
 import { silentLogger, tempWorkspace, testConfig } from "./helpers.js";
 
 const descriptor = (over: Partial<ToolDescriptor>): ToolDescriptor => ({
@@ -74,6 +74,56 @@ describe("Policy", () => {
     expect(await policy.revoke("exec_run:git")).toBe(true);
     expect(await policy.revoke("exec_run:git")).toBe(false);
     expect(policy.decide(exec, { command: "git" })).toBe("needs_approval");
+  });
+
+  it("keeps a standing allow inside the workspace it was granted in", async () => {
+    // The button says "Always allow `git` in <project>". Carrying that into a
+    // different root once the workspace can move would be the daemon doing
+    // something other than what the human read and clicked.
+    const scoped = new Policy(testConfig(fixture.root), silentLogger, fixture.workspaces);
+    await scoped.load();
+    const exec = descriptor({ name: "exec_run", risk: "exec" });
+    await scoped.allowAlways(exec, { command: "git" });
+    expect(scoped.decide(exec, { command: "git" })).toBe("auto");
+
+    await fixture.workspaces.switchTo(fixture.other);
+    expect(scoped.decide(exec, { command: "git" })).toBe("needs_approval");
+
+    // Not revoked, only out of scope — switching back restores it.
+    await fixture.workspaces.switchTo(fixture.root);
+    expect(scoped.decide(exec, { command: "git" })).toBe("auto");
+  });
+
+  it("labels the always-allow button with the live root, not the startup one", async () => {
+    const scoped = new Policy(testConfig(fixture.root), silentLogger, fixture.workspaces);
+    await scoped.load();
+    const exec = descriptor({ name: "exec_run", risk: "exec" });
+    expect(scoped.alwaysLabel(exec, { command: "git" })).toContain(path.basename(fixture.root));
+    await fixture.workspaces.switchTo(fixture.other);
+    expect(scoped.alwaysLabel(exec, { command: "git" })).toContain(path.basename(fixture.other));
+  });
+
+  it("drops rules written before roots were recorded, rather than guessing one", async () => {
+    // Failing closed: the worst case is one more approval prompt, where the
+    // alternative is a standing grant applied to a directory nobody agreed to.
+    await fsp.writeFile(
+      path.join(fixture.root, "allowlist.json"),
+      JSON.stringify({
+        rules: [{ key: "exec_run:git", label: "Always allow `git`", addedAt: "2024-01-01" }],
+      }),
+    );
+    const fresh = new Policy(testConfig(fixture.root), silentLogger);
+    await fresh.load();
+    expect(fresh.decide(descriptor({ name: "exec_run", risk: "exec" }), { command: "git" })).toBe(
+      "needs_approval",
+    );
+    expect(fresh.listAll()).toEqual([]);
+  });
+
+  it("separates the storage key from the tool key", () => {
+    expect(scopedKey("/a", "fs_write")).not.toBe(scopedKey("/b", "fs_write"));
+    // A NUL separator, so no root and tool name can be concatenated two ways.
+    expect(scopedKey("/a", "fs_write")).toBe("/a\0fs_write");
   });
 
   it("survives a corrupt allowlist file rather than refusing to start", async () => {

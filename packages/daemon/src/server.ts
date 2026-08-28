@@ -18,6 +18,7 @@ import type { Registry } from "./registry.js";
 import { ToolError } from "./tools/types.js";
 import { tokenMatches } from "./token.js";
 import { ServerUnavailable } from "./mcp/manager.js";
+import { WorkspaceRefused, type WorkspaceManager } from "./workspace.js";
 
 /** A frame bigger than this is not a tool call, it is an attempt to exhaust memory. */
 const MAX_FRAME_BYTES = 2 * 1024 * 1024;
@@ -28,6 +29,7 @@ const MAX_INFLIGHT = 8;
 
 export interface DaemonServerDeps {
   config: Config;
+  workspaces: WorkspaceManager;
   registry: Registry;
   policy: Policy;
   mcp: McpManager;
@@ -62,10 +64,23 @@ export class DaemonServer {
       this.sessions.add(session);
     });
 
-    this.unsubscribe = this.deps.mcp.onChange(() => {
+    const stopWatchingMcp = this.deps.mcp.onChange(() => {
       const servers = this.deps.mcp.statuses();
       for (const session of this.sessions) session.send({ kind: "tools_changed", servers });
     });
+    // Every session hears about a move, not just the one that asked for it — a
+    // second tab showing the old root is a lie about what the tools can reach,
+    // and the daemon can also move itself when its config file changes.
+    const stopWatchingWorkspace = this.deps.workspaces.onChange((workspace) => {
+      const roots = this.deps.workspaces.roots();
+      for (const session of this.sessions) {
+        session.send({ kind: "workspace_changed", workspace: workspace.root, roots });
+      }
+    });
+    this.unsubscribe = () => {
+      stopWatchingMcp();
+      stopWatchingWorkspace();
+    };
 
     const address = wss.address();
     return typeof address === "object" && address !== null ? address.port : this.deps.config.port;
@@ -194,6 +209,9 @@ class Session {
       case "cancel":
         this.inflight.get(parsed.id)?.abort(new Error("cancelled by client"));
         return;
+      case "set_workspace":
+        await this.onSetWorkspace(parsed);
+        return;
       default:
         this.fail("bad_request", `unknown kind ${String((parsed as { kind: string }).kind)}`);
     }
@@ -223,7 +241,8 @@ class Session {
     this.send({
       kind: "ready",
       version: WIRE_VERSION,
-      workspace: this.deps.config.workspace,
+      workspace: this.deps.workspaces.root,
+      roots: this.deps.workspaces.roots(),
       servers: this.deps.mcp.statuses(),
     });
   }
@@ -238,6 +257,39 @@ class Session {
     // or something trying to approve a call it was never offered.
     if (!this.broker.resolve(msg.nonce, decision)) {
       this.deps.log.warn("discarded approval for unknown or expired nonce");
+    }
+  }
+
+  /**
+   * Move the workspace root.
+   *
+   * The authorization is entirely `WorkspaceManager.switchTo`: it accepts only
+   * a root the user granted in the config file, or a subdirectory of one. So
+   * this handler needs no trust in the caller — the worst a hostile page that
+   * somehow reached this message could do is move between directories its user
+   * already wrote down, and the move is audited and announced to every session.
+   * It cannot name a directory of its own.
+   */
+  private async onSetWorkspace(msg: { id?: unknown; root?: unknown }): Promise<void> {
+    const id = typeof msg.id === "string" ? msg.id : undefined;
+    if (typeof msg.root !== "string") {
+      this.fail("bad_request", "set_workspace needs a root", id);
+      return;
+    }
+    try {
+      const workspace = await this.deps.workspaces.switchTo(msg.root);
+      // Answered directly as well as broadcast: the caller needs the reply tied
+      // to its id so the popup can report success or failure for *this* click.
+      this.send({
+        kind: "workspace_changed",
+        ...(id === undefined ? {} : { id }),
+        workspace: workspace.root,
+        roots: this.deps.workspaces.roots(),
+      });
+    } catch (err) {
+      const message = err instanceof WorkspaceRefused ? err.message : String(err);
+      this.deps.log.audit(`REFUSED set_workspace ${msg.root}: ${message}`);
+      this.fail("workspace_refused", message, id);
     }
   }
 
@@ -278,11 +330,18 @@ class Session {
     const controller = new AbortController();
     this.inflight.set(id, controller);
 
+    // The jail this call belongs to, pinned here and used for every step below.
+    // The root can move while the call sits in front of a human, and a call
+    // must run against the workspace it was validated and approved under — the
+    // approval prompt names that directory, so anything else is the daemon
+    // doing something other than what was agreed to.
+    const workspace = this.deps.workspaces.current;
+
     try {
       // Refuse the obviously-invalid before bothering a human, so an approval
       // prompt always describes something that would actually run if allowed.
       try {
-        registry.validate(msg.name, args);
+        registry.validate(msg.name, args, workspace);
       } catch (err) {
         const { code, message } = classify(err);
         log.audit(`REJECTED ${descriptor.name} from ${origin}: ${message}`);
@@ -292,14 +351,14 @@ class Session {
 
       // Authorization happens here, before anything runs, using only the
       // daemon's own state. Nothing in `msg` can change the answer.
-      if (policy.decide(descriptor, args) === "needs_approval") {
+      if (policy.decide(descriptor, args, workspace.root) === "needs_approval") {
         const outcome = await this.broker.request({
           callId: id,
           descriptor,
           args,
           origin,
           summary: registry.summarize(msg.name, args),
-          alwaysLabel: policy.alwaysLabel(descriptor, args),
+          alwaysLabel: policy.alwaysLabel(descriptor, args, workspace.root),
           signal: controller.signal,
           send: (message) => this.send(message),
         });
@@ -309,11 +368,11 @@ class Session {
           this.fail("denied", "the user declined this call", id);
           return;
         }
-        if (outcome === "allow_always") await policy.allowAlways(descriptor, args);
+        if (outcome === "allow_always") await policy.allowAlways(descriptor, args, workspace.root);
       }
 
       log.audit(`RUN ${descriptor.name} from ${origin} — ${registry.summarize(msg.name, args)}`);
-      const result = await registry.call(msg.name, args, origin, controller.signal);
+      const result = await registry.call(msg.name, args, origin, controller.signal, workspace);
       this.send({ kind: "result", id, result });
     } catch (err) {
       const { code, message } = classify(err);
@@ -327,6 +386,7 @@ class Session {
 
 function classify(err: unknown): { code: ErrorCode; message: string } {
   if (err instanceof JailViolation) return { code: "jail_violation", message: err.message };
+  if (err instanceof WorkspaceRefused) return { code: "workspace_refused", message: err.message };
   if (err instanceof ServerUnavailable) return { code: "server_unavailable", message: err.message };
   if (err instanceof ToolError) return { code: err.code as ErrorCode, message: err.message };
   if (err instanceof Error) {

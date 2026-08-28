@@ -39,6 +39,8 @@ const RECONNECT_MAX_MS = 30_000;
 export class DaemonConnection {
   state: ConnectionState = "idle";
   workspace: string | null = null;
+  /** Roots the daemon will switch between. Reported by it; never assembled here. */
+  workspaceRoots: string[] = [];
   tools: ToolDescriptor[] = [];
   servers: ServerStatus[] = [];
   lastError: string | null = null;
@@ -46,6 +48,7 @@ export class DaemonConnection {
   private socket: WebSocket | undefined;
   private pairing: Pairing | undefined;
   private readonly waiters = new Map<string, Waiter>();
+  private readonly workspaceWaiters = new Map<string, { resolve(root: string): void; reject(err: Error): void; timer: ReturnType<typeof setTimeout> }>();
   private readonly toolWaiters = new Set<(tools: ToolDescriptor[]) => void>();
   private nextId = 1;
   private reconnectDelay = RECONNECT_BASE_MS;
@@ -74,6 +77,7 @@ export class DaemonConnection {
     this.socket = undefined;
     this.state = "idle";
     this.workspace = null;
+    this.workspaceRoots = [];
     this.tools = [];
     this.servers = [];
     this.events.onStateChange();
@@ -141,6 +145,7 @@ export class DaemonConnection {
       case "ready":
         this.state = "ready";
         this.workspace = message.workspace;
+        this.workspaceRoots = message.roots ?? [];
         this.servers = message.servers;
         this.reconnectDelay = RECONNECT_BASE_MS;
         this.refreshTools();
@@ -159,6 +164,22 @@ export class DaemonConnection {
         this.refreshTools();
         this.events.onStateChange();
         return;
+
+      case "workspace_changed": {
+        this.workspace = message.workspace;
+        this.workspaceRoots = message.roots;
+        // Broadcast, so it arrives with no id when another tab did the moving.
+        if (message.id !== undefined) {
+          const waiter = this.workspaceWaiters.get(message.id);
+          if (waiter) {
+            clearTimeout(waiter.timer);
+            this.workspaceWaiters.delete(message.id);
+            waiter.resolve(message.workspace);
+          }
+        }
+        this.events.onStateChange();
+        return;
+      }
 
       case "result": {
         const waiter = this.waiters.get(message.id);
@@ -179,6 +200,13 @@ export class DaemonConnection {
           this.events.onStateChange();
         }
         if (message.id === undefined) return;
+        const pendingSwitch = this.workspaceWaiters.get(message.id);
+        if (pendingSwitch) {
+          clearTimeout(pendingSwitch.timer);
+          this.workspaceWaiters.delete(message.id);
+          pendingSwitch.reject(new Error(message.message));
+          return;
+        }
         const waiter = this.waiters.get(message.id);
         if (!waiter) return;
         clearTimeout(waiter.timer);
@@ -214,6 +242,11 @@ export class DaemonConnection {
       waiter.reject(new Error(reason));
     }
     this.waiters.clear();
+    for (const [, waiter] of this.workspaceWaiters) {
+      clearTimeout(waiter.timer);
+      waiter.reject(new Error(reason));
+    }
+    this.workspaceWaiters.clear();
     this.toolWaiters.clear();
   }
 
@@ -265,6 +298,32 @@ export class DaemonConnection {
       } catch (err) {
         clearTimeout(timer);
         this.waiters.delete(id);
+        reject(err as Error);
+      }
+    });
+  }
+
+  /**
+   * Ask the daemon to move to `root`.
+   *
+   * Relay only, exactly like an approval: the daemon decides whether `root` is
+   * one it was granted, and refuses otherwise. Nothing here filters or widens —
+   * this class holding the socket must not also hold an opinion about which
+   * directories are allowed, or a bug in it becomes a security bug.
+   */
+  setWorkspace(root: string): Promise<string> {
+    const id = `w${this.nextId++}`;
+    return new Promise<string>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.workspaceWaiters.delete(id);
+        reject(new Error("the daemon did not answer"));
+      }, 10_000);
+      this.workspaceWaiters.set(id, { resolve, reject, timer });
+      try {
+        this.send({ kind: "set_workspace", id, root });
+      } catch (err) {
+        clearTimeout(timer);
+        this.workspaceWaiters.delete(id);
         reject(err as Error);
       }
     });

@@ -8,6 +8,8 @@
  * from "the content script is not finding the DOM".
  *
  *   node scripts/probe.mjs tools
+ *   node scripts/probe.mjs roots
+ *   node scripts/probe.mjs workspace /path/to/other-project
  *   node scripts/probe.mjs call fs_read '{"path":"README.md"}'
  *   node scripts/probe.mjs call exec_run '{"command":"git","args":["status"]}'
  *   node scripts/probe.mjs --port 8792 --deny call fs_write '{"path":"x","content":"y"}'
@@ -15,9 +17,13 @@
  * Approval prompts are answered on stdin unless --allow/--deny is passed.
  */
 import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import * as readline from "node:readline/promises";
+
+// The daemon keeps its state beside the project, so this script looks in the
+// same place rather than in $HOME. `scripts/` sits directly under the root.
+const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 const args = process.argv.slice(2);
 const flag = (name, fallback) => {
@@ -36,12 +42,15 @@ const bool = (name) => {
 
 const auto = bool("--allow") ? "allow_once" : bool("--deny") ? "deny" : null;
 const port = Number(flag("--port", process.env.WEBMCP_PORT ?? 8767));
-const tokenFile = flag("--token-file", path.join(homedir(), ".webmcp", "token"));
+const tokenFile = flag("--token-file", path.join(projectRoot, ".webmcp", "token"));
 const origin = flag("--origin", "https://chatgpt.com");
 const [command, toolName, argsJson] = args;
 
-if (!command || (command === "call" && !toolName)) {
-  process.stderr.write("usage: probe.mjs [--port N] [--allow|--deny] tools | call <tool> [json]\n");
+// `workspace` takes a directory where `call` takes a tool name — same slot.
+if (!command || ((command === "call" || command === "workspace") && !toolName)) {
+  process.stderr.write(
+    "usage: probe.mjs [--port N] [--allow|--deny] tools | roots | workspace <dir> | call <tool> [json]\n",
+  );
   process.exit(2);
 }
 
@@ -96,8 +105,18 @@ socket.addEventListener("message", async (event) => {
           `mcp:${server.id} ${server.state}${server.error ? ` (${server.error})` : ""}\n`,
         );
       }
-      if (command === "tools") send({ kind: "list_tools", id: "1" });
+      process.stderr.write(`roots:     ${(message.roots ?? []).join(", ") || "none"}\n`);
+      if (command === "roots") done(0);
+      else if (command === "tools") send({ kind: "list_tools", id: "1" });
+      // The popup's route, driven by hand. The daemon refuses anything that is
+      // not a granted root, so this is also how you check that it does.
+      else if (command === "workspace") send({ kind: "set_workspace", id: "1", root: toolName });
       else send({ kind: "call_tool", id: "1", name: toolName, args: toolArgs, origin });
+      return;
+
+    case "workspace_changed":
+      process.stdout.write(`workspace is now ${message.workspace}\n`);
+      done(0);
       return;
 
     case "tools":

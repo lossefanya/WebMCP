@@ -26,6 +26,16 @@
         <dt>MCP servers</dt>
         <dd id="servers">none</dd>
       </dl>
+      <div id="switcher" hidden>
+        <label for="workspace-pick">Switch workspace</label>
+        <select id="workspace-pick"></select>
+        <button id="do-switch" class="ghost" type="button">Switch</button>
+        <p class="hint">
+          Only directories granted in the daemon config appear here. Add another with
+          <code>--set-workspace &lt;dir&gt;</code>, or by editing
+          <code>.webmcp/config.json</code>.
+        </p>
+      </div>
       <button id="inject" class="primary" type="button">Inject tool instructions into this chat</button>
       <button id="diagnose" class="ghost" type="button">Diagnose this page</button>
       <button id="unpair" class="ghost" type="button">Unpair</button>
