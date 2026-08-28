@@ -1,0 +1,21 @@
+{
+  "name": "webmcp",
+  "private": true,
+  "version": "0.0.1",
+  "description": "MCP tool access for browser-based LLM chat UIs",
+  "type": "module",
+  "workspaces": [
+    "packages/protocol",
+    "packages/daemon",
+    "packages/extension"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "npm run build -w @webmcp/protocol && npm run build -w @webmcp/daemon && npm run build -w @webmcp/extension",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test -w @webmcp/daemon && npm run test -w @webmcp/extension",
+    "daemon": "npm run build -w @webmcp/protocol && npm run build -w @webmcp/daemon && npm run start -w @webmcp/daemon --"
+  }
+}

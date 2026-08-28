@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>WebMCP</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <span id="dot" class="dot"></span>
+      <h1>WebMCP</h1>
+      <button id="reconnect" class="ghost" type="button" hidden>Reconnect</button>
+    </header>
+
+    <section id="approvals" hidden>
+      <h2>Waiting for you</h2>
+      <div id="approval-list"></div>
+    </section>
+
+    <section id="status" hidden>
+      <dl>
+        <dt>Workspace</dt>
+        <dd id="workspace">—</dd>
+        <dt>Tools</dt>
+        <dd id="tools">—</dd>
+        <dt>MCP servers</dt>
+        <dd id="servers">none</dd>
+      </dl>
+      <button id="inject" class="primary" type="button">Inject tool instructions into this chat</button>
+      <button id="diagnose" class="ghost" type="button">Diagnose this page</button>
+      <button id="unpair" class="ghost" type="button">Unpair</button>
+      <pre id="report" hidden></pre>
+    </section>
+
+    <section id="pair" hidden>
+      <p class="hint">
+        Start the daemon, then paste its pairing token here. Run
+        <code>webmcp-daemon --print-token</code> to see it again.
+      </p>
+      <label for="token">Pairing token</label>
+      <input id="token" type="password" autocomplete="off" spellcheck="false" />
+      <label for="port">Port</label>
+      <input id="port" type="number" min="1" max="65535" />
+      <button id="do-pair" class="primary" type="button">Pair</button>
+    </section>
+
+    <p id="error" class="error" hidden></p>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>
