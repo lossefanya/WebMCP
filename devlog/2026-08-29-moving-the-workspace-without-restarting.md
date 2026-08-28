@@ -1,13 +1,19 @@
-# 2026-08-29 — Moving the workspace without restarting, and four bugs the users found
+# 2026-08-29 — Moving the workspace without restarting, and five bugs the users found
 
 Started with one question — "I want to change working dir without re-running the daemon" — and ended
-up touching the security model, the state directory, the popup, and the documentation rules. Four
-real bugs came out of it. I found one by writing a test; the user found the other three by using the
+up touching the security model, the state directory, the popup, and the documentation rules. Five
+real bugs came out of it. I found one by writing a test; the user found the other four by using the
 thing, which is the honest ratio.
 
-**Final state:** 360 tests green (186 daemon, 174 extension), up from 296 at the end of the last
+**Final state:** 362 tests green (186 daemon, 176 extension), up from 296 at the end of the last
 session. +1,225 / −78 lines across 20 existing files, plus three new ones: `daemon/src/workspace.ts`,
-`daemon/test/workspace.test.ts`, `extension/test/popup.test.ts`.
+`daemon/test/workspace.test.ts`, `extension/test/popup.test.ts`. Shipped as `f36a313` and `810069f`
+on `runtime-workspace-switching`.
+
+**Amended after the fact.** The last bug below was found the following session, once the branch was
+already pushed — the picker had never actually been used by a human when this was first written. It
+belongs here rather than in its own entry, because it is this feature and it is the sharpest instance
+of the pattern the rest of the entry is about.
 
 ---
 
@@ -65,7 +71,7 @@ to a directory nobody named.
 
 ---
 
-## Three bugs the user found
+## Four bugs the user found
 
 ### The popup had no tests at all, and I said so only when asked
 
@@ -130,6 +136,37 @@ Two things fell out of it: confirmations were rendering red like failures, which
 the line that also carries real errors, so they got their own tone; and ambient text is deliberately
 *not* dismissible, since clearing it would last one second and read as broken.
 
+### The picker could not be used at all, and the comment above it said why
+
+The one that matters most, because everything above it was verification theatre by comparison: you
+select the second directory in the dropdown and within a second it snaps back to the first, so the
+Switch button is never reachable. Not "awkward" — the feature could not be operated.
+
+`renderSwitcher` pushed the active root into the `<select>` on every render, and render runs once a
+second to keep the approval countdown moving. The user's half-made choice was read as a disagreement
+to correct.
+
+The hazard was known. The comment directly above that code, written by me, said *"resetting a
+`<select>` under someone mid-choice would make it unusable"* — and the guard was applied to the
+**options rebuild** while the **value assignment three lines below it** stayed unconditional. I
+identified the failure mode precisely, fixed the half I happened to be looking at, and wrote the
+other half down as prose instead of as an assertion.
+
+The 20 popup tests written a few hours earlier did not catch it. One of them —
+`does not rebuild the dropdown on the one-second redraw` — tests the *adjacent* line. A test aimed
+two statements to the left of the bug, in a file I had just written specifically because the popup
+was untested.
+
+**Fix:** track the active root separately, and push the value only when it *changes* — a switch from
+this popup, another tab, or `--set-workspace` in a terminal. Comparing against `pick.value`, as
+before, cannot distinguish "the daemon moved" from "the user is choosing". Two tests: the selection
+survives 2.5s of redraws (fails against the old code with `expected 'project-a' to be 'project-b'`),
+and the control still follows a move made elsewhere, so the guard does not freeze it instead.
+
+The daemon was verified innocent before touching the popup — a switch holds, and the tools read from
+the new root six seconds later. Worth doing: "it reverts" reads like state being overwritten
+server-side, and the temptation was to go looking there first.
+
 ---
 
 ## The documentation rule
@@ -189,17 +226,31 @@ consequence.
 and unexercised while I reported "all tests pass" after each. True, and beside the point. It is worth
 naming which parts of a change are verified and which are merely compiled.
 
-**Mutation-test anything guarding a race or a redraw.** Five fixes this session were confirmed by
+**Mutation-test anything guarding a race or a redraw.** Six fixes this session were confirmed by
 re-breaking them: the approval-wait pin, the dropdown rebuild, the notice ordering, the missing
-broadcast, the message expiry. Two of those tests would have passed against the broken code if I had
-written them slightly differently.
+broadcast, the message expiry, the picker snap-back. Two of those tests would have passed against the
+broken code if I had written them slightly differently.
+
+**A comment is not a test, and writing one is not doing the other.** The snap-back was described
+accurately in a comment sitting directly above the line that caused it. Prose that identifies a
+hazard reads, to the person who wrote it, exactly like a hazard that has been handled — which makes
+it worse than saying nothing, because it stops the search. When a comment names a failure mode, that
+sentence is a test that has not been written yet.
+
+**Click the thing.** Every bug the user found this session was in the half I could not exercise from a
+terminal, and the last one made the feature completely unusable by anyone. jsdom proved the markup,
+the wiring and the logic agreed with each other; it could not prove that a human can operate the
+control, because it never has to wait a second between two actions. "Verified in jsdom, not in
+Chrome" was recorded as an open item and then not treated as one.
 
 ---
 
 ## Open items
 
-- The picker is verified in jsdom, not in Chrome. The logic, wiring and markup agree; that a real
-  popup window renders correctly is still unconfirmed.
+- ~~The picker is verified in jsdom, not in Chrome.~~ **Closed by the snap-back bug**, which is what
+  was hiding behind this line: the gap was not rendering, it was that jsdom never waits a second
+  between two human actions. Still unconfirmed in Chrome are the parts jsdom cannot see at all —
+  layout, the disabled/greyed states, and whether the notice line is legible.
 - No CLI flag grants a directory *without* also switching to it — `--set-workspace` does both. Adding
   to the list alone means editing the config by hand, which works and is documented, but a
   `--grant-workspace` would be more honest about the two operations being different.

@@ -4,8 +4,9 @@ Second session of the day, and a short one. Shipped the workspace-switching bran
 rest of it on a question that turned out to be about the shape of the protocol rather than a bug:
 "unlike the CLI, it stops after writing a file. I have to say *continue*. Why?"
 
-**Final state:** 360 tests green (186 daemon, 174 extension) — unchanged, plus three assertions on the
-preamble. +71 / −1 across `CLAUDE.md`, `packages/protocol/src/fence.ts`,
+**Final state:** 360 tests green (186 daemon, 174 extension) at the time of writing, plus three
+assertions on the preamble. (It ended the day at 362 — a picker bug found right after this was
+written is recorded in the workspace entry, where the feature lives.) +71 / −1 across `CLAUDE.md`, `packages/protocol/src/fence.ts`,
 `packages/daemon/test/fence.test.ts`. The workspace work from earlier today is committed as `f36a313`
 on `runtime-workspace-switching`.
 
