@@ -1,3 +1,5 @@
+import * as fsp from "node:fs/promises";
+import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { execTools } from "../src/tools/exec.js";
 import { ToolError } from "../src/tools/types.js";
@@ -46,6 +48,14 @@ describe("exec_run", () => {
     const result = await run({ command: "node", args: ["-e", "process.stdout.write(process.cwd())"] });
     expect(result.isError).toBe(false);
     expect(result.content[0]?.text).toContain(fixture.root);
+  });
+
+  it("creates a directory with mkdir, which the default allowlist permits", async () => {
+    // There was no route to a bare empty directory before this: `fs_write` makes
+    // parents on the way to a file, and nothing made a directory on its own.
+    const result = await run({ command: "mkdir", args: ["-p", "nested/deep"] });
+    expect(result.isError).toBe(false);
+    await expect(fsp.stat(path.join(fixture.root, "nested", "deep"))).resolves.toBeDefined();
   });
 
   it("does not interpret shell metacharacters", async () => {

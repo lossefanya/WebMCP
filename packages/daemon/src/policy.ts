@@ -25,6 +25,64 @@ import type { WorkspaceManager } from "./workspace.js";
  */
 export type Decision = "auto" | "needs_approval";
 
+/**
+ * Binaries that may never carry a standing allow.
+ *
+ * The exec allowlist is a coarse filter, not a containment boundary: `cwd` is
+ * the workspace but arguments are never path-checked, and every binary here can
+ * run code of its own choosing —
+ *
+ *   node -e / python3 -c        arbitrary code, straight away
+ *   npm / npx                   lifecycle scripts, and fetches code off the network
+ *   make                        shell commands from a Makefile `fs_write` can create
+ *   awk 'BEGIN{system("…")}'    documented shell escape
+ *   find -exec                  runs any binary, allowlist or not
+ *   sed -i                      writes to any absolute path (GNU sed also has `e`)
+ *   git -c alias.x='!sh …'      alias and hook execution
+ *
+ * Each was verified escaping a live jail, not assumed. Per-call approval shows
+ * the human the exact argv, which is a real check. A standing allow does not:
+ * `allowKey` is keyed on the binary with no constraint on arguments, so
+ * approving `node -e "console.log(1)"` with **Always** would silently authorise
+ * every later `node -e <anything>`. Against a threat model whose first line is
+ * "the page is hostile", that converts one reasonable-looking click into
+ * unattended arbitrary code execution.
+ *
+ * So these stay per-call forever. The button is not offered, and the daemon
+ * refuses to record the rule even if a decision arrives claiming otherwise —
+ * the extension renders prompts, it does not decide what may be remembered.
+ */
+const NO_STANDING_ALLOW = new Set([
+  "node",
+  "npm",
+  "npx",
+  "python3",
+  "python",
+  "make",
+  "awk",
+  "find",
+  "sed",
+  "git",
+  "perl",
+  "ruby",
+  "bash",
+  "sh",
+  "zsh",
+  "env",
+  "xargs",
+]);
+
+/**
+ * Whether this call shape may ever be remembered. Read risk is excluded because
+ * it is auto-approved anyway and never reaches an approval prompt.
+ */
+export function canAllowAlways(descriptor: ToolDescriptor, args: Record<string, unknown>): boolean {
+  if (descriptor.risk === "read") return false;
+  if (descriptor.name !== "exec_run") return true;
+  const command = typeof args.command === "string" ? args.command : "";
+  return !NO_STANDING_ALLOW.has(command);
+}
+
 export interface AllowRule {
   key: string;
   /** Workspace root this rule was granted in. Absent in files written before scoping. */
@@ -57,6 +115,7 @@ export class Policy {
         ? ((raw as { rules: unknown[] }).rules as AllowRule[])
         : [];
       let unscoped = 0;
+      const revoked: string[] = [];
       for (const rule of entries) {
         if (typeof rule?.key !== "string") continue;
         // A rule with no root predates scoping, so there is no way to know which
@@ -67,7 +126,20 @@ export class Policy {
           unscoped++;
           continue;
         }
+        // A rule saved before this binary was restricted is exactly the standing
+        // grant the restriction exists to remove, so dropping it on load is the
+        // whole point — leaving it would protect only users who never clicked.
+        const binary = rule.key.startsWith("exec_run:") ? rule.key.slice("exec_run:".length) : null;
+        if (binary !== null && NO_STANDING_ALLOW.has(binary)) {
+          revoked.push(binary);
+          continue;
+        }
         this.rules.set(scopedKey(rule.root, rule.key), rule);
+      }
+      if (revoked.length > 0) {
+        this.log.warn(
+          `policy: dropped standing allow(s) for ${[...new Set(revoked)].join(", ")} — these can run arbitrary code, so they are asked about every time`,
+        );
       }
       if (unscoped > 0) {
         this.log.warn(
@@ -103,6 +175,18 @@ export class Policy {
     args: Record<string, unknown>,
     root = this.root,
   ): Promise<void> {
+    // Enforcement, not just a hidden button. The label being absent stops the
+    // popup offering it; this stops a decision that claims "always" anyway from
+    // being remembered. The call still runs — a human did approve it — it is
+    // only the standing grant that is refused.
+    if (!canAllowAlways(descriptor, args)) {
+      this.log.audit(
+        `policy: refused a standing allow for ${descriptor.name}` +
+          (descriptor.name === "exec_run" ? ` ${String(args.command)}` : "") +
+          " — it can run arbitrary code, so it is asked about every time",
+      );
+      return;
+    }
     const key = allowKey(descriptor, args);
     const label = allowLabel(descriptor, args, root);
     this.rules.set(scopedKey(root, key), { key, root, label, addedAt: new Date().toISOString() });
@@ -133,7 +217,7 @@ export class Policy {
     args: Record<string, unknown>,
     root = this.root,
   ): string | undefined {
-    if (descriptor.risk === "read") return undefined;
+    if (!canAllowAlways(descriptor, args)) return undefined;
     return allowLabel(descriptor, args, root);
   }
 }

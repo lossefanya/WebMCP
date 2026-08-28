@@ -216,6 +216,77 @@ describe("DaemonServer", () => {
     await client.next("approval_request", (m) => m.callId === "c2");
   });
 
+  describe("standing allows for code-executing binaries", () => {
+    it("offers no always-allow button for node", async () => {
+      const client = await paired();
+      client.send({
+        kind: "call_tool",
+        id: "c1",
+        name: "exec_run",
+        args: { command: "node", args: ["-e", "console.log(1)"] },
+        origin: ORIGIN,
+      });
+      const prompt = await client.next("approval_request");
+      expect(prompt.allowAlwaysLabel).toBeUndefined();
+      client.send({ kind: "approval_response", nonce: prompt.nonce, decision: "deny" });
+    });
+
+    it("keeps prompting even after a decision that claimed always", async () => {
+      // The exact escalation this exists to stop: approve a harmless
+      // `node -e "console.log(1)"` with Always, and every later `node -e
+      // <anything>` would run unprompted — unattended arbitrary code execution
+      // from one reasonable-looking click, on a channel the page can inject into.
+      const client = await paired();
+      client.send({
+        kind: "call_tool",
+        id: "c1",
+        name: "exec_run",
+        args: { command: "node", args: ["-e", "console.log(1)"] },
+        origin: ORIGIN,
+      });
+      const first = await client.next("approval_request");
+      client.send({ kind: "approval_response", nonce: first.nonce, decision: "allow_always" });
+      await client.next("result", (m) => m.id === "c1");
+
+      client.send({
+        kind: "call_tool",
+        id: "c2",
+        name: "exec_run",
+        args: { command: "node", args: ["-e", "console.log(2)"] },
+        origin: ORIGIN,
+      });
+      const second = await client.next("approval_request", (m) => m.callId === "c2");
+      expect(second.callId).toBe("c2");
+      client.send({ kind: "approval_response", nonce: second.nonce, decision: "deny" });
+    });
+
+    it("still remembers a binary that cannot run code of its own", async () => {
+      const client = await paired();
+      client.send({
+        kind: "call_tool",
+        id: "c1",
+        name: "exec_run",
+        args: { command: "ls", args: [] },
+        origin: ORIGIN,
+      });
+      const prompt = await client.next("approval_request");
+      expect(prompt.allowAlwaysLabel).toContain("ls");
+      client.send({ kind: "approval_response", nonce: prompt.nonce, decision: "allow_always" });
+      await client.next("result", (m) => m.id === "c1");
+
+      // Second call runs with no prompt at all.
+      client.send({
+        kind: "call_tool",
+        id: "c2",
+        name: "exec_run",
+        args: { command: "ls", args: ["-a"] },
+        origin: ORIGIN,
+      });
+      const result = await client.next("result", (m) => m.id === "c2");
+      expect(result.result.isError).toBe(false);
+    });
+  });
+
   it("binds loopback only", () => {
     // Not asserted by connecting from elsewhere — asserted by the fact that
     // there is no non-loopback interface to connect from in a test. The

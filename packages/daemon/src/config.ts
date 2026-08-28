@@ -63,6 +63,9 @@ export const DEFAULT_EXEC_ALLOW = [
   "grep",
   "rg",
   "find",
+  // `fs_write` with `create_dirs` already makes parents on the way to a file;
+  // this is for the bare "make an empty directory" case, which had no route.
+  "mkdir",
   "node",
   "npm",
   "npx",
