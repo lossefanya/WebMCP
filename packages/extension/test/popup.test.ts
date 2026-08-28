@@ -308,6 +308,34 @@ describe("popup workspace picker", () => {
     expect([...pick.options].map((o) => o.textContent)).toContain(nasty);
   });
 
+  it("leaves a half-made choice alone across the one-second redraw", async () => {
+    // The bug: the value was re-synced to the active root on *every* render, and
+    // render runs once a second for the approval countdown. Picking the second
+    // root snapped back before you could reach the Switch button, which made
+    // changing directory impossible.
+    await mountPopup(baseState());
+    const pick = el<HTMLSelectElement>("workspace-pick");
+    pick.value = "/home/me/project-b";
+
+    await vi.advanceTimersByTimeAsync(2_500);
+    await flush();
+
+    expect(pick.value).toBe("/home/me/project-b");
+  });
+
+  it("still follows the active root when the daemon moves on its own", async () => {
+    // Another tab switching, or --set-workspace from a terminal, must still be
+    // reflected — the guard above must not freeze the control instead.
+    await mountPopup(baseState());
+    expect(el<HTMLSelectElement>("workspace-pick").value).toBe("/home/me/project-a");
+
+    reply = () => ({ kind: "ui_state", state: baseState({ workspace: "/home/me/project-b" }) });
+    await vi.advanceTimersByTimeAsync(1_100);
+    await flush();
+
+    expect(el<HTMLSelectElement>("workspace-pick").value).toBe("/home/me/project-b");
+  });
+
   it("does not rebuild the dropdown on the one-second redraw", async () => {
     // `refresh()` runs every second for the approval countdown. Resetting a
     // <select> under someone mid-choice would make it unusable.

@@ -149,11 +149,17 @@ function render(state: UiState): void {
  * the hint naming `--set-workspace` — the only way to add a second — was hidden
  * along with it, so the control only showed up once you no longer needed telling.
  *
- * Rebuilt only when the list actually changes: this runs once a second for the
- * approval countdown, and resetting a <select> under someone mid-choice would
- * make it unusable.
+ * Neither the options nor the selected value may be rewritten on a plain
+ * redraw. This runs once a second for the approval countdown, and a <select>
+ * rewritten under someone mid-choice is not merely annoying — it is unusable,
+ * because the snap-back beats them to the Switch button. So both are tracked:
+ * the options are rebuilt only when the list changes, and the value is pushed
+ * only when the *active root* changes, which means a move that happened
+ * elsewhere rather than a choice being made here.
  */
 let renderedRoots = "";
+/** Active root as of the last time the value was pushed into the control. */
+let syncedWorkspace = "";
 
 function renderSwitcher(state: UiState): void {
   const roots = state.workspaceRoots;
@@ -176,8 +182,17 @@ function renderSwitcher(state: UiState): void {
       option.textContent = root;
       pick.append(option);
     }
+    // A rebuild resets the selection to the first option, so whatever was shown
+    // before means nothing now — force the sync below.
+    syncedWorkspace = "";
   }
-  if (state.workspace && pick.value !== state.workspace) pick.value = state.workspace;
+  // Only on an actual move: a switch from this popup, another tab, or
+  // --set-workspace in a terminal. Comparing against `pick.value` instead would
+  // read the user's own half-made choice as a disagreement to correct.
+  if (state.workspace && state.workspace !== syncedWorkspace) {
+    pick.value = state.workspace;
+    syncedWorkspace = state.workspace;
+  }
 
   // With the socket down the roots on screen are the last ones the daemon
   // reported, and a switch would only produce "not connected". Offering a
