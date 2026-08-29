@@ -71,4 +71,17 @@ export const claudeAdapter: SiteAdapter = {
       'button[aria-label="Send message"]',
       'button[aria-label*="Send message" i]',
     ]),
+
+  /**
+   * The upload input, for results too large to paste. Confirmed in the captured
+   * transcript as `<input id="chat-input-file-upload-bottom"
+   * data-testid="file-upload" aria-hidden="true" tabindex="-1" type="file">` —
+   * always present, with no `accept` list restricting what may go up.
+   */
+  fileInput: () =>
+    firstMatch<HTMLInputElement>([
+      'input[data-testid="file-upload"]',
+      "input#chat-input-file-upload-bottom",
+      'input[type="file"]',
+    ]),
 };

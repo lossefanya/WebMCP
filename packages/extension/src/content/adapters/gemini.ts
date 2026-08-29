@@ -75,4 +75,38 @@ export const geminiAdapter: SiteAdapter = {
       "button.send-button",
       'button[aria-label*="Send" i]',
     ]),
+
+  /**
+   * The upload input — but only once the menu is open.
+   *
+   * Gemini differs from the other hosts here and it matters: the captured
+   * zero-state DOM contains no `<uploader>` and no `input[type="file"]` at all.
+   * Both appear inside a CDK overlay that is created when "Upload and tools" is
+   * clicked, which is why this host needs `uploadTrigger` as well. The overlay
+   * holds two identical inputs (one inside `<images-files-uploader>`, one
+   * directly under `<uploader>`); either will do, and both carry the same long
+   * `accept` list, which includes `.md`.
+   */
+  fileInput: () =>
+    firstMatch<HTMLInputElement>([
+      'uploader input[type="file"][accept*=".md"]',
+      'input.hidden-file-input[accept*=".md"]',
+      "input.hidden-file-input",
+      'input[type="file"][accept*=".md"]',
+    ]),
+
+  /**
+   * `<gem-icon-button arialabel="Upload and tools">` wrapping a real
+   * `<button aria-label="Upload and tools" aria-expanded aria-haspopup="menu">`.
+   * The inner button is the one to click — Angular Material binds the handler
+   * there, not on the custom-element wrapper — and its `aria-expanded` is how
+   * the menu gets closed again afterwards.
+   */
+  uploadTrigger: () =>
+    firstMatch<HTMLElement>([
+      'button[aria-label="Upload and tools"]',
+      'gem-icon-button[arialabel="Upload and tools"] button',
+      'gem-icon-button[arialabel*="Upload" i] button',
+      'button[aria-label*="Upload" i]',
+    ]),
 };

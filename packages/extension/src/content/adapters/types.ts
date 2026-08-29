@@ -37,6 +37,34 @@ export interface SiteAdapter {
 
   /** The button that sends the composer's contents, if the site has one. */
   submitButton(): HTMLElement | null;
+
+  /**
+   * The host's own file-upload input, if it has one.
+   *
+   * Present because a large tool result cannot be typed: every composer here is
+   * a rich-text editor that reconciles a node per line, and tens of thousands
+   * of characters freeze the tab. Uploading the same bytes as a file is the way
+   * around that, and this is the only site-specific part of it.
+   *
+   * Returning null is always safe — the caller falls back to pasting a
+   * shortened result, which is what happened before uploads existed.
+   */
+  fileInput?(): HTMLInputElement | null;
+
+  /**
+   * The control that *reveals* the file input, on a host that only creates one
+   * when asked.
+   *
+   * Gemini is why this exists: its uploader lives in a CDK overlay that does not
+   * exist until "Upload and tools" is clicked, so `fileInput()` is null at rest
+   * and there is nothing to attach to. Naming the trigger here keeps the
+   * site-specific part a selector, with the clicking done generically.
+   *
+   * Only ever clicked when a result actually needs uploading, and only after
+   * `isPlausibleUploadTrigger` agrees — a wrong click here opens a menu at best
+   * and sends the turn early at worst.
+   */
+  uploadTrigger?(): HTMLElement | null;
 }
 
 /**

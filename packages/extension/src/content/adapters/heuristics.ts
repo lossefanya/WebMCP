@@ -262,6 +262,88 @@ function shortText(el: Element): string | null {
 }
 
 /**
+ * Whether this input would accept a file with the given name and type.
+ *
+ * `accept` is a real filter, not decoration: a profile-picture input says
+ * `image/*` and would silently reject a markdown file, and refusing it here is
+ * the difference between falling back to a paste and sending a message with a
+ * missing attachment. An input with no `accept` takes anything.
+ */
+export function acceptsFile(
+  input: HTMLInputElement,
+  filename: string,
+  mediaType: string,
+): boolean {
+  const accept = input.getAttribute("accept")?.trim();
+  if (!accept) return true;
+
+  const extension = filename.slice(filename.lastIndexOf(".")).toLowerCase();
+  const [group] = mediaType.split("/");
+  return accept.split(",").some((raw) => {
+    const rule = raw.trim().toLowerCase();
+    if (rule === "" || rule === "*/*") return true;
+    if (rule.startsWith(".")) return rule === extension;
+    if (rule.endsWith("/*")) return rule.slice(0, -2) === group;
+    return rule === mediaType.toLowerCase();
+  });
+}
+
+/**
+ * Whether it is safe to click this element to open the uploader.
+ *
+ * The mirror of `isPlausibleSubmit`, and needed for the same reason: this is
+ * the second element on the page the extension clicks on its own initiative,
+ * and the failure modes are the ones this project has already been bitten by
+ * once. Sending the turn early is the worst of them — the covering note would
+ * go out before the file — so anything that reads as send, or as the composer's
+ * microphone, is refused outright.
+ *
+ * Unlike the submit check, an *unlabelled* element is refused too. There is no
+ * such thing as a send-by-Enter fallback here: if the label does not positively
+ * say "upload", not clicking costs a shortened paste, and clicking the wrong
+ * thing costs the user something real.
+ */
+const UPLOAD_TRIGGER = /upload|attach|paperclip|add file|add photo|add image/i;
+const NOT_UPLOAD_TRIGGER = /send|submit|dictat|mic|voice|record|stop|delete|remove|download/i;
+
+export function isPlausibleUploadTrigger(el: Element): boolean {
+  const label = labelOf(el);
+  return UPLOAD_TRIGGER.test(label) && !NOT_UPLOAD_TRIGGER.test(label);
+}
+
+/**
+ * A file input near the composer, for hosts whose own selector is missing or
+ * has gone stale.
+ *
+ * Scoped by widening from the composer, exactly like `guessSubmitButton`, and
+ * for the same reason: on one host the input is a sibling of the composer and
+ * on another it is several levels up. Deliberately *not* filtered by
+ * visibility — every one of these is `display: none` and clicked through a
+ * label — so `accept` is doing the work of ruling out the wrong input, which is
+ * mostly an avatar uploader saying `image/*`.
+ *
+ * Returning null is safe: the caller pastes a shortened result instead.
+ */
+export function guessFileInput(
+  composer: HTMLElement | null,
+  filename: string,
+  mediaType: string,
+): HTMLInputElement | null {
+  const start = composer?.closest("form") ?? composer ?? document.body;
+
+  let scope: HTMLElement | null = start;
+  for (let depth = 0; depth < MAX_ANCESTOR_WALK && scope; depth++) {
+    const found = [...scope.querySelectorAll<HTMLInputElement>('input[type="file"]')].find(
+      (input) => !input.disabled && acceptsFile(input, filename, mediaType),
+    );
+    if (found) return found;
+    if (scope === document.body) break;
+    scope = scope.parentElement;
+  }
+  return null;
+}
+
+/**
  * Wrap an adapter so every lookup falls back to a heuristic, and record which
  * lookups needed one. `fellBackOn` is what the popup shows — a working page
  * that is limping tells you the adapter needs updating before it breaks
@@ -269,6 +351,9 @@ function shortText(el: Element): string | null {
  */
 export interface WrappedAdapter extends SiteAdapter {
   readonly fellBackOn: Set<string>;
+  /** Always present after wrapping, unlike the adapter's own optional hooks. */
+  fileInput(): HTMLInputElement | null;
+  uploadTrigger(): HTMLElement | null;
 }
 
 export function withFallbacks(adapter: SiteAdapter): WrappedAdapter {
@@ -319,5 +404,33 @@ export function withFallbacks(adapter: SiteAdapter): WrappedAdapter {
       if (guess) fellBackOn.add("submitButton");
       return guess;
     },
+
+    // A host with no `fileInput` of its own is not a broken adapter — two of
+    // the four have no captured upload control — so this guesses without
+    // complaint, and null simply means big results keep being pasted.
+    // Deliberately not guessed. Finding an input is harmless, but *clicking*
+    // something to reveal one is not, so this is named-selector-only: a host
+    // whose trigger moves stops uploading rather than starts clicking around.
+    uploadTrigger: () => adapter.uploadTrigger?.() ?? null,
+
+    fileInput: () => {
+      const named = adapter.fileInput?.() ?? null;
+      if (named) return named;
+      const guess = guessFileInput(
+        adapter.composer() ?? guessComposer(),
+        PROBE_FILENAME,
+        PROBE_MEDIA_TYPE,
+      );
+      if (guess) fellBackOn.add("fileInput");
+      return guess;
+    },
   };
 }
+
+/**
+ * What the guess measures an `accept` list against. The real filename is not
+ * known until a result arrives, but every one of them is a `.md` document, so
+ * an input that would refuse this would refuse all of them.
+ */
+const PROBE_FILENAME = "webmcp-result.md";
+const PROBE_MEDIA_TYPE = "text/markdown";

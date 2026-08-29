@@ -52,4 +52,22 @@ export const chatgptAdapter: SiteAdapter = {
       'button[aria-label*="Send" i]',
       'form button[type="submit"]',
     ]),
+
+  /**
+   * The upload input, for results too large to paste. Present at rest — no menu
+   * to open, unlike Gemini — as
+   * `<input type="file" id="upload-files" data-photo-upload-enabled="true" multiple>`,
+   * visually hidden by an inline clip-rect rather than `display: none`.
+   *
+   * The id leads because three *other* file inputs sit right beside it on the
+   * same page (`#upload-photos`, `#upload-camera`, `#upload-media-files`), all
+   * of them `accept="image/*"`. `#upload-files` is the only one with no
+   * `accept` at all, which is what lets a `.md` result through — and what makes
+   * the `acceptsFile` check load-bearing here rather than theoretical.
+   */
+  fileInput: () =>
+    firstMatch<HTMLInputElement>([
+      'input#upload-files[type="file"]',
+      'input[type="file"][data-photo-upload-enabled]',
+    ]),
 };

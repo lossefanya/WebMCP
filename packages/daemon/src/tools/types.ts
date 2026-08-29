@@ -9,6 +9,25 @@ export interface ToolContext {
   /** Host page the call came from, for audit lines. */
   readonly origin: string;
   readonly signal: AbortSignal;
+  /**
+   * How many bytes of text this result may carry before it is cut short.
+   *
+   * Per-call rather than read from `config.limits`, because the answer depends
+   * on the caller: a page that can upload the result as a file has no reason
+   * to be held to the paste budget, and one that cannot must be. Tools that
+   * truncate read it from here so there is a single place the two budgets meet.
+   */
+  readonly maxResultBytes: number;
+  /**
+   * The caller can upload this result as a file rather than paste it.
+   *
+   * A tool that frames its output for a chat message — `fs_read` prefixes the
+   * path and size — should hand back the bare content instead when this is set,
+   * because the framing is repeated in the covering message and a header line
+   * inside the *file* is corruption: a CSV gains a bogus first row and a JSON
+   * file stops parsing.
+   */
+  readonly canAttach: boolean;
 }
 
 /** The subset of context available before approval — no signal, nothing runs yet. */

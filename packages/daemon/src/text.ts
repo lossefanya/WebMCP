@@ -14,7 +14,7 @@ function notice(shown: string, total: number): string {
 }
 
 /** Cut `body` to at most `maxBytes` of UTF-8, never mid-code-point. */
-function sliceBytes(body: string, maxBytes: number): string {
+export function sliceBytes(body: string, maxBytes: number): string {
   const buf = Buffer.from(body, "utf8");
   if (buf.length <= maxBytes) return body;
   let shown = buf.subarray(0, maxBytes).toString("utf8");

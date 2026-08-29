@@ -1,5 +1,12 @@
-import { isPlausibleSubmit, submitRejectionReason } from "./adapters/heuristics.js";
 import type { SiteAdapter } from "./adapters/index.js";
+import { acceptsFile, isPlausibleSubmit, submitRejectionReason } from "./adapters/heuristics.js";
+import {
+  type PendingAttachment,
+  attachFile,
+  chipScope,
+  dismissUploader,
+  revealFileInput,
+} from "./attach.js";
 
 /**
  * Typing into somebody else's editor.
@@ -11,7 +18,15 @@ import type { SiteAdapter } from "./adapters/index.js";
  * sync. It is deprecated and works everywhere; the alternative is a per-host
  * reimplementation of each editor's internals.
  */
-export type SubmitStatus = "sent" | "busy" | "streaming" | "no_composer" | "insert_failed" | "no_submit";
+export type SubmitStatus =
+  | "sent"
+  | "busy"
+  | "streaming"
+  | "no_composer"
+  | "insert_failed"
+  | "no_submit"
+  /** The file never went up. The caller has a fallback: paste a shortened result. */
+  | "attach_failed";
 
 export interface SubmitOutcome {
   status: SubmitStatus;
@@ -19,10 +34,20 @@ export interface SubmitOutcome {
   detail: string;
 }
 
+/**
+ * Type `text` into the composer and send it, optionally with a file attached
+ * first.
+ *
+ * The attachment goes up *before* anything is typed, so a failed upload leaves
+ * the composer untouched and the caller can fall back to pasting a shortened
+ * result without first having to clear a half-written turn.
+ */
 export async function insertAndSubmit(
   adapter: SiteAdapter,
-  text: string,
+  message: string,
+  attachment?: PendingAttachment,
 ): Promise<SubmitOutcome> {
+  let text = message;
   const composer = adapter.composer();
   if (!composer) {
     return { status: "no_composer", detail: "could not find the message composer on this page" };
@@ -35,6 +60,15 @@ export async function insertAndSubmit(
   const existing = currentText(composer);
   if (existing.trim() !== "") {
     return { status: "busy", detail: `the composer already contains ${existing.length} characters` };
+  }
+
+  if (attachment) {
+    const attached = await attach(adapter, composer, attachment);
+    if ("status" in attached) return attached;
+    // The covering message names the file, and the name may have changed on the
+    // way in — a host whose `accept` list does not know `.zig` gets `.zig.md`.
+    // Substituting here keeps the message honest about what actually went up.
+    text = text.split(attachment.filename).join(attached.filename);
   }
 
   composer.focus();
@@ -79,6 +113,54 @@ export async function insertAndSubmit(
         ? "typed the message, but neither the send button nor Enter submitted it"
         : "typed the message, but could not find a send button and Enter did not submit it"),
   };
+}
+
+/**
+ * Get the file into the composer, opening the host's uploader first if that is
+ * the only way to reach one. Returns the failure, or null on success.
+ */
+async function attach(
+  adapter: SiteAdapter,
+  composer: HTMLElement,
+  attachment: PendingAttachment,
+): Promise<SubmitOutcome | { filename: string }> {
+  const fail = (detail: string): SubmitOutcome => ({ status: "attach_failed", detail });
+
+  let input = adapter.fileInput?.() ?? null;
+  // Only clicked when the input is genuinely absent. On the hosts that keep one
+  // in the composer at all times there is no reason to open anything, and not
+  // clicking is always the safer of the two.
+  const trigger = input ? null : (adapter.uploadTrigger?.() ?? null);
+  if (!input && trigger) {
+    input = await revealFileInput(trigger, () => adapter.fileInput?.() ?? null);
+  }
+  if (!input) {
+    return fail("this page has no file input to upload to");
+  }
+
+  // The daemon names the attachment after the file that was read, so the model
+  // and the user can see which one it is. Most of those names go up untouched —
+  // both hosts with an `accept` list take `.csv`, `.json`, `.ts` and so on — but
+  // the lists are finite (neither takes `.zig` or `.log`), and a name the host
+  // refuses would mean falling back to a truncated paste for no good reason.
+  // Appending `.md` is the escape hatch, not the default it used to be.
+  const usable = acceptsFile(input, attachment.filename, attachment.mediaType)
+    ? attachment
+    : { ...attachment, filename: `${attachment.filename}.md`, mediaType: "text/markdown" };
+
+  if (!acceptsFile(input, usable.filename, usable.mediaType)) {
+    return fail(`this page's uploader refuses ${attachment.filename}`);
+  }
+
+  // Scoped to the composer, not the input: a revealed input sits in an overlay
+  // that is torn down when the menu closes, and the chip appears by the
+  // composer either way.
+  const outcome = await attachFile(input, usable, { scope: chipScope(composer) });
+  if (trigger) dismissUploader(trigger);
+
+  return outcome === "attached"
+    ? { filename: usable.filename }
+    : fail(`could not attach ${usable.filename}: ${outcome}`);
 }
 
 /** Poll briefly: submission is asynchronous in all three editors. */

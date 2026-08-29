@@ -104,14 +104,21 @@ every non-obvious rule below was learned that way, and none of them was guessabl
 
 - **claude.ai** — fully confirmed, both ends. Composer (`[data-testid="chat-input"]`, TipTap), send
   button (`chat-input-send`, which exists but is `disabled` and `inert` while the composer is empty),
-  streaming flags (`data-perf-row-streaming`, `data-is-streaming`) and assistant turns
-  (`[data-perf-row="assistant"]`) all pinned. The richest fixture of the four — it is the one that
+  streaming flags (`data-perf-row-streaming`, `data-is-streaming`), assistant turns
+  (`[data-perf-row="assistant"]`) and the upload input (`[data-testid="file-upload"]`, always present,
+  with no `accept` list) all pinned. The richest fixture of the four — it is the one that
   revealed the user-turn hazard.
-- **chatgpt.com** — working. Assistant turn and nested-`<pre>` code block confirmed and pinned.
+- **chatgpt.com** — working. Assistant turn and nested-`<pre>` code block confirmed and pinned, as is
+  the upload input: `#upload-files`, present at rest with **no `accept` attribute**, alongside three
+  image-only pickers (`#upload-photos`, `#upload-camera`, `#upload-media-files`) that a
+  proximity-based guess would have had a one-in-four chance of choosing. Still the least-confirmed of
+  the four — the composer and send-button selectors are written from knowledge, not from a capture.
 - **perplexity.ai** — fully confirmed, both ends. Composer (`#ask-input`, Lexical), answers
   (`[data-workflow-final-text]`, with the Copy/Share/thumbs row a *sibling*
   `[data-workflow-text-footer]`), code blocks (`<pre><figure><figcaption>` — the language label lives
-  in the figcaption *outside* the `<code>`) and `button[aria-label="Submit"]` all pinned. This is
+  in the figcaption *outside* the `<code>`) and `button[aria-label="Submit"]` all pinned. The upload
+  input is pinned too — an always-present `<input type="file" accept=".bash,…,.md,…">` in the
+  composer toolbar, keyed on that `accept` list because it carries no id or test id. This is
   where the voice-mode click happened; a regression test asserts *no* button is clicked on the zero
   state. Only `isStreaming` is still a guess — the captured thread was idle.
 - **gemini.google.com** — fully confirmed, both ends, and observed executing `fs_read` and `fs_write`
@@ -119,7 +126,11 @@ every non-obvious rule below was learned that way, and none of them was guessabl
   (`<model-response>` → `<message-content>`), code blocks (`<code-block>` →
   `<pre><code data-test-id="code-content">`) and streaming (`aria-busy` on `.markdown-main-panel`) all
   pinned. Like Perplexity it renders **no send button** until the composer has text, and delivers via
-  Enter.
+  Enter. Its uploader is the odd one of the four: there is **no `input[type="file"]` in the DOM at
+  all** until `button[aria-label="Upload and tools"]` is clicked, which builds a CDK overlay holding
+  `<uploader>` and two identical `input.hidden-file-input` (accept list includes `.md`). Both states
+  are pinned — `GEMINI_ZERO_STATE` for the absence, `GEMINI_UPLOAD_MENU` for the overlay. ChatGPT has
+  its upload input pinned too (see above).
 
 ## Project Overview
 
@@ -290,6 +301,61 @@ Rules learned by getting this wrong against the real chatgpt.com DOM:
 - **Closedness inferred from the DOM is a guess, not an observation.** Treat inferred-unclosed as
   "needs a longer settling window", never as a refusal, or a host that looks permanently mid-stream
   deadlocks every call. Only the literal-text path may refuse outright.
+- **An unterminated block is unfinished, not malformed.** `includeUnclosed` hands half-written blocks
+  to the *call* path so the caller's settling window can decide — and it used to hand them to the
+  error path too. Half a JSON object never parses, so every intermediate state of a long `fs_write`
+  read as a broken tool call and drew its own "your tool call could not be read" reply, interrupting
+  the model repeatedly while it wrote a big file. `collectFromBlocks` now requires `block.closed`
+  before reporting an error, and the extension settles errors through the same gate as calls.
+- **Everything already on screen when the scanner attaches is history, not work.** De-duplication
+  lives in memory, so a page reload, an extension reload or a crashed content script empties it — and
+  the next scan finds a transcript full of perfectly valid tool calls and starts working through
+  them. A user reported exactly that: a call aborted, and reopening the tab later ran the command
+  again. `CallGate.beginScan` writes off everything visible in the first `SEED_WINDOW_MS` (5s) after
+  attach without running it. The window is not a single first scan because these are SPAs and the
+  first scan can land before the turns hydrate; it disarms once there has been something to seed *or*
+  once the window closes, so a brand-new chat does not stay armed and swallow the model's first real
+  call.
+- **Freshness is measured from the block's last edit, and never from the page.** `MAX_CALL_AGE_MS`
+  (30s) drops a call that settled long ago and was never dispatched — a backgrounded tab, a blocked
+  scan. Measured from the last time the text *changed*, so a call that streamed for a minute is not
+  stale. Page timestamps are not used, and checking Perplexity settled it: an assistant turn carries
+  **no time signal at all** — no `<time>`, no `datetime`, no `data-time*`, nothing in its attribute
+  set (`aria-label, class, data-renderer, data-workflow-final-text, data-workflow-text-footer, dir,
+  lang, style, type`). The only timestamp it renders anywhere is a hover-revealed span on the *user*
+  bubble reading `23 Aug, 01:17` — the wrong element (`touchesUserTurn` exists to refuse reading
+  those), no year, no timezone, and page-controlled text a prompt-injected page could write anything
+  into. Observation time in the content script cannot be lied about.
+- **The page cannot date a call, but we can date our own action.** There is no way to tell from the
+  DOM whether a call was written 30 seconds or two days ago — see the Perplexity finding above. So
+  `content/history.ts` records every dispatch in `chrome.storage.local`, keyed by thread path
+  (`chatgpt.com/c/<id>`), and the scanner loads it *before* the first scan. A call this extension
+  already ran is refused however fresh the page makes it look, and the popup can say "already ran 2d
+  ago" rather than shrugging. Recorded at dispatch, not at completion: a call that was sent and then
+  abandoned is exactly the one that must not be retried on the next load.
+- **A call is recognised by the text of its block, so the `id` is what tells a repeat from a
+  re-read.** The scanner sees a conversation, not a stream of events: a call it ran stays on screen
+  forever, so "the same call again" and "the same call still there" are identical bytes unless the id
+  differs. The preamble now says so — *give every call a new id; reusing one means "this is that
+  call" and the repeat is ignored* — because the rule was being relied on without ever being stated.
+  The id itself is a free-form string, never a UUID and never validated: `parseToolCall` takes any
+  non-empty string and, when there is none, synthesises `h<hash(body)>` from the block. That fallback
+  is deliberate — refusing a whole call over a missing id would be worse — but it has a consequence
+  worth knowing: an id-less call is *content-addressed*, so two identical id-less calls are one call
+  by definition. The id is echoed back in the result block, which is what gives the model something
+  to count from.
+- **The stored record only has a say for `REPLAY_WINDOW_MS` (60s) after attach.** A transcript
+  replays immediately; past that window a matching call is the model asking again, not the page
+  showing the same message, and the record forgets it rather than refusing. Unbounded it would be
+  worse than the bug it fixes — a model that reuses call ids would have real repeats silently dropped
+  for a week.
+- **Seeding is the heuristic; the record is the fact.** Seeding has a tail — a page slow enough to
+  hydrate after the 5s window defeats it — and the stored record is what closes it. Neither replaces
+  the other: the record cannot know about calls made in a tab that never wrote to storage, and it is
+  keyed by a URL that a brand-new chat does not have yet.
+- **A skipped call is announced.** Silently not running looks exactly like a daemon that is not
+  connected. `stale` reports to the popup; the diagnostics report carries a `skipped` count so
+  "nothing happened when I reopened this tab" has an answer.
 - **Don't trust the MutationObserver alone.** These are SPAs; the node you attached to can be
   swapped out and then fires nothing forever. A slow poll alongside it removes that failure class.
 - **A selector the engine rejects must not throw.** `firstMatch`/`allMatches` swallow it — otherwise
@@ -376,6 +442,83 @@ Web chat UIs expose no native function-calling to an extension, so the protocol 
 Round-tripping through the visible conversation means every result is also context the model sees —
 truncate large file reads rather than pasting a megabyte into the chat.
 
+### Results too large to paste
+
+Pasting is the bottleneck, not the bytes. Every composer here is a rich-text editor that reconciles a
+node per line, so tens of thousands of characters through `execCommand("insertText")` is one
+enormous synchronous task and the tab stops responding. Past the paste budget the same bytes go up
+the host's own file-upload control instead, which is what `limits.maxAttachBytes` (1 MiB) bounds.
+
+Rules the implementation settled, none of them optional:
+
+- **The threshold lives in the daemon, and nowhere else.** `canAttach` on `call_tool` is the page
+  saying it *has* an uploader; `maxReadBytes` is still what decides whether a result is oversized,
+  and `attach` on the result is the daemon's instruction to upload it. The extension carries no
+  policy — it may decline, never widen. `canAttach` is also the one field on that message a hostile
+  page influences, so it must be harmless if it lies: it changes how many bytes come back, not what
+  may be read, and a page with `fs_read` could already page the same file with `offset`.
+- **An unconfirmed upload is a failure.** `attachFile` waits for the host to show the file — matched
+  on the filename *stem*, because these chips drop the extension — and clears the input if it never
+  appears. Sending "the output is attached" with nothing attached is worse than truncating: the model
+  answers from the covering note. Every failure falls back to a shortened paste.
+- **Attach before typing.** A failed upload then leaves the composer untouched, so the fallback has
+  somewhere to paste into.
+- **A host may have no input until you ask for one, and asking means clicking.** Gemini creates its
+  uploader in an overlay on demand, so `fileInput()` is null at rest. `uploadTrigger()` names the
+  button that reveals it; `revealFileInput` clicks it, waits, and `dismissUploader` toggles it back
+  when `aria-expanded` still says open. This is the second element the extension clicks unprompted,
+  so it gets the `isPlausibleSubmit` treatment in advance: `isPlausibleUploadTrigger` demands a
+  positively upload-ish label and — unlike the send check — refuses an *unlabelled* element too,
+  because there is no Enter-key fallback to make a miss cheap. `uploadTrigger` is never guessed:
+  finding an input is harmless, clicking something to produce one is not.
+- **Uploaders come in two shapes, and only one of them needs a click.** Perplexity, claude.ai and
+  chatgpt.com keep a real `input[type="file"]` in the composer at all times; Gemini alone builds one
+  on demand. Check for the input first and click nothing when it is already there.
+- **An attachment is the file, named as the file.** `fs_read` of `漢検漢字辞典漢字.csv` uploads
+  `webmcp-c2-漢検漢字辞典漢字.csv`, `text/csv`, holding the file's bytes and nothing else. Three
+  rules got it there, each of which was wrong in the first version:
+    - **Name it after the source**, not `webmcp-<tool>-<id>.md`. The name is the only thing in the
+      turn saying which file this is. It is sanitised as a *filename* — separators, control
+      characters and the Windows-reserved set removed — never with `safeName`'s `[A-Za-z0-9_-]` rule,
+      which turns a Japanese filename into a row of dashes and destroys the thing being added.
+    - **Drop the daemon's framing from the body.** `fs_read` prefixes `path (N bytes)` for a result
+      that will be *read in the chat*; inside an uploaded file that line is corruption — a CSV gains
+      a bogus first row, a JSON file stops parsing — and it was the whole reason attachments had to
+      be renamed `.md`. `ToolContext.canAttach` tells the tool which it is producing. Nothing is
+      lost: the path and size are in the covering message and in the filename.
+    - **`.md` is the fallback, not the default.** Both hosts with an `accept` list take `.csv`,
+      `.json` and `.ts`; neither takes `.zig` or `.log`. So the extension checks `acceptsFile` and
+      appends `.md` only when the real extension would be refused — then rewrites the covering
+      message so it does not name a file that is not the one attached.
+- **Confirm on the `marker`, never on the filename.** The conversation almost certainly contains the
+  source filename already — the user just asked for that file by name — so matching it would confirm
+  an upload that never happened. `marker` (`webmcp-c2`) cannot occur naturally and is short enough to
+  survive a chip that truncates.
+- **A host can have several file inputs, most of them wrong.** chatgpt.com has four at rest and three
+  are image pickers. `acceptsFile` is what separates them, which is why it runs both where an input
+  is chosen and again where the file is handed over.
+- **A menu item that opens the OS file picker is not an upload trigger.** claude.ai's "+" menu has
+  `data-testid="add-menu-upload-file"` ("Add files or photos", ⌘U) which looks exactly like Gemini's
+  trigger and is the opposite of useful: there is nothing to reveal — the input is already at rest —
+  and clicking it opens a *native* dialog that no page can drive and nothing here can dismiss,
+  leaving it in front of the user while the upload fails anyway. A trigger is only worth naming when
+  it materialises an `input` in the DOM. A regression test pins claude.ai as declaring no trigger.
+- **Dismiss by toggling, not with Escape.** A stray Escape in a chat UI can clear a draft or close
+  something else; and a menu that already closed itself would be *reopened* by a second click, which
+  is why `aria-expanded` is checked first.
+- **Confirm the upload against the composer, not the input.** A revealed input lives in an overlay
+  that is torn down when the menu closes, so a scope walked up from it is an orphaned subtree no chip
+  can ever appear in. `chipScope(composer)` is passed explicitly.
+- **Re-check `accept` at the point of use, not only where the input was found.** The same lesson as
+  `isPlausibleSubmit`: the adapter's selector list ends in a bare `input[type="file"]`, which on a
+  host that moves its uploader can match an avatar picker whose `image/*` would silently swallow the
+  file.
+- **A result that is one enormous line was the case that escaped the budget entirely.** `readLineRange`
+  emitted at least one line whatever its size, so a minified bundle or single-line JSON ignored
+  `maxReadBytes` and went straight into the composer — the exact input the cap exists for. It is now
+  cut to the budget, and says so with a different notice, because the usual "continue at
+  `offset: n+1`" would silently skip the rest of that line.
+
 ## MCP aggregation
 
 The daemon is an MCP **host**: it connects configured servers (stdio or HTTP) as a client, lists their
@@ -442,7 +585,10 @@ the directory is created `0700` with every file inside it `0600`. `mcpServers` t
 `claude_desktop_config.json` blocks verbatim; `workspace`, `workspaces`, `port`, `exec.allow` and
 `limits` are WebMCP's own. `workspaces` is the set the root may be switched to at runtime and is the
 consent decision behind the popup's picker — only the workspace fields are applied on reload, since
-ports, exec allowlists and MCP blocks are wired into objects built at startup. The pairing token and the standing-approval allowlist sit next to it as `token` and
+ports, exec allowlists and MCP blocks are wired into objects built at startup. Under `limits`,
+`maxReadBytes` (64 KiB) is the *paste* budget and `maxAttachBytes` (1 MiB) the ceiling for a result
+the page will upload instead; the two are resolved per call in `server.ts` from `canAttach` and
+reach the tool as `ctx.maxResultBytes`. The pairing token and the standing-approval allowlist sit next to it as `token` and
 `allowlist.json`, both `0600`.
 
 Driving the daemon by hand, without a browser — the fastest way to tell "the daemon is broken" apart
@@ -454,6 +600,7 @@ node scripts/probe.mjs roots
 node scripts/probe.mjs workspace ~/code/other
 node scripts/probe.mjs call fs_read '{"path":"README.md"}'
 node scripts/probe.mjs --allow call exec_run '{"command":"git","args":["status"]}'
+node scripts/probe.mjs --attach call fs_read '{"path":"big.json"}'   # claim a page with an uploader
 node scripts/probe.mjs --port 8792 --deny call fs_write '{"path":"x","content":"y"}'
 ```
 

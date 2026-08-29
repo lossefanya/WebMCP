@@ -79,4 +79,20 @@ export const perplexityAdapter: SiteAdapter = {
       'button[data-testid="submit-button"]',
       'button[aria-label="Send"]',
     ]),
+
+  /**
+   * The upload input, for results too large to paste.
+   *
+   * Perplexity keeps it in the composer toolbar at all times as
+   * `<input multiple accept="…" type="file" style="display: none;">` — it does
+   * not appear only once the "Add files or tools" menu is open, which is what
+   * makes this usable without clicking through a menu. It carries no id or test
+   * id, so the `accept` list is the most specific thing about it, and that list
+   * includes `.md`.
+   */
+  fileInput: () =>
+    firstMatch<HTMLInputElement>([
+      'input[type="file"][accept*=".md"]',
+      "input[type='file']",
+    ]),
 };

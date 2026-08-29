@@ -102,6 +102,24 @@ describe("filesystem tools", () => {
       expect(body).toMatch(/Continue with \{"path": "big.txt", "offset": \d+\}/);
     });
 
+    /**
+     * The case that escaped the budget entirely. Emitting at least one line
+     * whatever its size sounds harmless until the file *is* one line: a
+     * minified bundle or a single-line JSON blob came back whole, ignoring
+     * `maxReadBytes`, and went straight into the composer.
+     */
+    it("cuts a single line that is longer than the whole budget", async () => {
+      await fsp.writeFile(path.join(fixture.root, "one-line.json"), `${"x".repeat(200_000)}\n`);
+      const body = (await fsRead.run({ path: "one-line.json" }, ctx(small))).content[0]!;
+
+      expect(body.text.length).toBeLessThan(10_000);
+      expect(body.truncated).toBe(true);
+      // And it says the rest is not reachable by paging, rather than offering a
+      // resume offset that would silently skip the remainder of the line.
+      expect(body.text).toMatch(/longer than the 2048-byte result budget/);
+      expect(body.text).not.toContain('"offset"');
+    });
+
     it("says so when the offset is past the end, rather than returning nothing", async () => {
       // A bare header reads as "the file is empty here", which is what sent a
       // model round in circles paging a file it had already finished.

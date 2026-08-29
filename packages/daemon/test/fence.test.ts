@@ -189,6 +189,48 @@ describe("looksLikeToolCall", () => {
   });
 });
 
+describe("collectFromBlocks and blocks that are still being typed", () => {
+  const block = (body: string, closed: boolean) => ({
+    tag: "webmcp",
+    body,
+    closed,
+    raw: body,
+  });
+
+  /**
+   * The bug: a caller that infers closedness from the DOM passes
+   * `includeUnclosed` so it can apply its own settling window to a *call*. That
+   * also handed every half-written block to the error path, and half a JSON
+   * object never parses — so a long `fs_write` drew a "your tool call could not
+   * be read" reply for each intermediate state it passed through, interrupting
+   * the model repeatedly while it wrote a big file.
+   */
+  it("does not call an unfinished block malformed", () => {
+    const half = '{"id":"1","tool":"fs_write","args":{"path":"a.txt","content":"the first ha';
+    const { calls, errors } = collectFromBlocks([block(half, false)], { includeUnclosed: true });
+
+    expect(calls).toHaveLength(0);
+    expect(errors).toHaveLength(0);
+  });
+
+  it("still reports one that finished and is genuinely malformed", () => {
+    const bad = '{"id":"1","tool":}';
+    const { errors } = collectFromBlocks([block(bad, true)], { includeUnclosed: true });
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]?.message).toMatch(/not valid JSON/);
+  });
+
+  /** And an unfinished block that *does* parse is still offered as a call, so
+   *  the caller's settling window remains the thing that decides. */
+  it("still offers an unfinished-looking block that parses", () => {
+    const whole = '{"id":"1","tool":"fs_read","args":{"path":"a.txt"}}';
+    const { calls } = collectFromBlocks([block(whole, false)], { includeUnclosed: true });
+
+    expect(calls).toHaveLength(1);
+  });
+});
+
 describe("rendering", () => {
   it("describes each tool's parameters in the preamble", () => {
     const preamble = renderPreamble(
@@ -213,6 +255,10 @@ describe("rendering", () => {
     // It is phrased around completion and names its exits, because an
     // open-ended "keep going" is the phrasing that spins.
     expect(preamble).toContain("Work the task through to completion");
+    // The id rule. A call is recognised by the text of its block, so a model
+    // that reuses ids emits byte-identical text for a genuine repeat and has it
+    // read as the same call. That contract has to be stated, not assumed.
+    expect(preamble).toContain("Give every call a new `id`");
     expect(preamble).toMatch(/Stop when the task is done/);
     expect(preamble).toMatch(/denied/);
     // The worked example must not name a real file: it parses as a valid call

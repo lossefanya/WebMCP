@@ -59,6 +59,178 @@ describe("DaemonServer", () => {
     await fixture.cleanup();
   });
 
+  /**
+   * The paste budget exists because a rich-text composer given tens of
+   * thousands of characters freezes the tab — not because a large result is
+   * dangerous. So a caller that says it can upload the result as a file is held
+   * to a different budget, and gets the bytes whole.
+   */
+  describe("oversized results", () => {
+    const BIG = 200_000;
+
+    const readBig = async (canAttach: boolean | undefined) => {
+      await fsp.writeFile(path.join(fixture.root, "big.txt"), "x".repeat(BIG) + "\n");
+      const client = await paired();
+      client.send({
+        kind: "call_tool",
+        id: "c1",
+        name: "fs_read",
+        args: { path: "big.txt" },
+        origin: ORIGIN,
+        ...(canAttach === undefined ? {} : { canAttach }),
+      });
+      const message = await client.next("result", (m) => m.id === "c1");
+      return message.result.content[0]!;
+    };
+
+    it("truncates to the paste budget when the caller cannot attach", async () => {
+      const part = await readBig(false);
+      expect(part.attach).toBeUndefined();
+      expect(part.truncated).toBe(true);
+      expect(part.text.length).toBeLessThan(BIG);
+    });
+
+    /** A client that predates the flag must behave exactly as it did before. */
+    it("treats a missing flag as cannot attach", async () => {
+      const part = await readBig(undefined);
+      expect(part.attach).toBeUndefined();
+      expect(part.truncated).toBe(true);
+    });
+
+    it("sends the whole file and marks it for upload when the caller can attach", async () => {
+      const part = await readBig(true);
+      expect(part.text.length).toBeGreaterThan(BIG);
+      expect(part.truncated).toBe(false);
+      expect(part.attach?.mediaType).toBe("text/plain");
+      // The filename names the file that was read, because that is the only
+      // thing in the turn that tells the model what it is looking at — and it
+      // keeps the extension it was read under rather than being renamed `.md`.
+      expect(part.attach?.filename).toBe("webmcp-c1-big.txt");
+      // And the body is the file, with none of the daemon's own framing: the
+      // path and size live in the covering message and in the filename, and a
+      // header line inside the file is corruption.
+      expect(part.text.startsWith("x")).toBe(true);
+      expect(part.text).not.toContain("big.txt (");
+      // The marker is the short unique token the extension looks for in the
+      // page to know the upload actually landed.
+      expect(part.attach?.marker).toBe("webmcp-c1");
+    });
+
+    /**
+     * The filename is a filename, not an identifier. An earlier sanitiser
+     * stripped everything outside `[A-Za-z0-9_-]`, which turned a Japanese
+     * filename into a row of dashes and threw away the one piece of information
+     * the name exists to carry.
+     */
+    it("keeps a non-ASCII source name intact", async () => {
+      const name = "漢検漢字辞典漢字.csv";
+      await fsp.writeFile(path.join(fixture.root, name), "x".repeat(BIG) + "\n");
+      const client = await paired();
+      client.send({
+        kind: "call_tool",
+        id: "c1",
+        name: "fs_read",
+        args: { path: name },
+        origin: ORIGIN,
+        canAttach: true,
+      });
+      const message = await client.next("result", (m) => m.id === "c1");
+      const attach = message.result.content[0]!.attach;
+      expect(attach?.filename).toBe(`webmcp-c1-${name}`);
+      // Typed from the extension it kept, which is the point of keeping it.
+      expect(attach?.mediaType).toBe("text/csv");
+    });
+
+    /** A path separator must never reach the host's uploader as a filename. */
+    it("takes only the basename of a nested path", async () => {
+      await fsp.mkdir(path.join(fixture.root, "deep"), { recursive: true });
+      await fsp.writeFile(path.join(fixture.root, "deep", "notes.md"), "x".repeat(BIG) + "\n");
+      const client = await paired();
+      client.send({
+        kind: "call_tool",
+        id: "c1",
+        name: "fs_read",
+        args: { path: "deep/notes.md" },
+        origin: ORIGIN,
+        canAttach: true,
+      });
+      const message = await client.next("result", (m) => m.id === "c1");
+      const filename = message.result.content[0]!.attach!.filename;
+      expect(filename).toBe("webmcp-c1-notes.md");
+      expect(filename).not.toContain("/");
+    });
+
+    /**
+     * The framing is dropped only for the upload. A result small enough to
+     * paste still says which file it came from, because there is no filename
+     * carrying that for it.
+     */
+    it("keeps the path header on a result that is pasted rather than attached", async () => {
+      const client = await paired();
+      client.send({
+        kind: "call_tool",
+        id: "c1",
+        name: "fs_read",
+        args: { path: "a.txt" },
+        origin: ORIGIN,
+        canAttach: true,
+      });
+      const message = await client.next("result", (m) => m.id === "c1");
+      expect(message.result.content[0]!.attach).toBeUndefined();
+      expect(message.result.content[0]!.text).toContain("a.txt (5 bytes)");
+    });
+
+    /** A tool with no source file names the attachment after itself. */
+    it("falls back to the tool name, as markdown, when there is no path", async () => {
+      await server.close();
+      await boot({
+        limits: { ...testConfig(fixture.root).limits, maxListEntries: 1_000 },
+      });
+      for (let i = 0; i < 400; i++) {
+        await fsp.writeFile(path.join(fixture.root, `pad-${i}-${"x".repeat(180)}.txt`), "");
+      }
+      const client = await paired();
+      client.send({
+        kind: "call_tool",
+        id: "c1",
+        name: "fs_list",
+        args: {},
+        origin: ORIGIN,
+        canAttach: true,
+      });
+      const message = await client.next("result", (m) => m.id === "c1");
+      const attach = message.result.content[0]!.attach;
+      expect(attach?.filename).toBe("webmcp-c1-fs_list.md");
+      expect(attach?.mediaType).toBe("text/markdown");
+    });
+
+    /**
+     * The attach budget is still a budget. Past it the result is truncated as
+     * usual rather than marked for an upload nobody bounded.
+     */
+    it("still truncates beyond the attach budget", async () => {
+      await server.close();
+      await boot({ limits: { ...testConfig(fixture.root).limits, maxAttachBytes: 4_096 } });
+      const part = await readBig(true);
+      expect(part.truncated).toBe(true);
+      expect(part.text.length).toBeLessThan(BIG);
+    });
+
+    it("never marks an error result for upload", async () => {
+      const client = await paired();
+      client.send({
+        kind: "call_tool",
+        id: "c1",
+        name: "fs_read",
+        args: { path: "no-such-file.txt" },
+        origin: ORIGIN,
+        canAttach: true,
+      });
+      const error = await client.next("error", (m) => m.id === "c1");
+      expect(error.code).toBeDefined();
+    });
+  });
+
   describe("set_workspace", () => {
     it("announces the granted roots on ready", async () => {
       const client = await paired();

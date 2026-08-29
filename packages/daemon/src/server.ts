@@ -5,6 +5,7 @@ import {
   type ClientMessage,
   type ErrorCode,
   type ServerToClientMessage,
+  type ToolResult,
   WIRE_VERSION,
 } from "@webmcp/protocol";
 import { WebSocket, WebSocketServer } from "ws";
@@ -293,6 +294,60 @@ class Session {
     }
   }
 
+  /**
+   * How many bytes this call's result may carry.
+   *
+   * The small cap exists because the result is *pasted* — a rich-text composer
+   * handed tens of thousands of characters locks the tab up — so a caller that
+   * will upload it instead is held to a different one. `Math.max` because a
+   * config where the attach budget is the smaller number should never shrink a
+   * result below what pasting already allowed.
+   */
+  private resultBudget(msg: CallToolMessage): number {
+    const { maxReadBytes, maxAttachBytes } = this.deps.config.limits;
+    return msg.canAttach === true ? Math.max(maxReadBytes, maxAttachBytes) : maxReadBytes;
+  }
+
+  /**
+   * Mark an oversized result for upload.
+   *
+   * The daemon decides this, not the extension, so the paste threshold lives in
+   * exactly one place — the same `maxReadBytes` that does the truncating when
+   * nobody can attach. The extension is free to decline (the upload can fail,
+   * and the host may have moved its file input) and fall back to pasting, which
+   * is the behaviour that existed before this flag.
+   *
+   * Only a single-part text result is marked. A multi-part result is rendered
+   * by joining the parts, so attaching "the body" would silently redefine what
+   * the model is being shown.
+   */
+  private markAttachable(
+    result: ToolResult,
+    id: string,
+    tool: string,
+    args: Record<string, unknown>,
+    msg: CallToolMessage,
+  ): ToolResult {
+    if (msg.canAttach !== true || result.isError || result.content.length !== 1) return result;
+    const only = result.content[0];
+    if (only === undefined || only.type !== "text") return result;
+
+    const bytes = Buffer.byteLength(only.text, "utf8");
+    if (bytes <= this.deps.config.limits.maxReadBytes) return result;
+
+    const marker = `webmcp-${safeName(id)}`;
+    const source = sourceName(tool, args);
+    const filename = `${marker}-${source}`;
+    // Worth an audit line of its own: this is the one path where a large chunk
+    // of a local file leaves as a file upload rather than as chat text, and the
+    // terminal is where the user watches what the daemon hands out.
+    this.deps.log.audit(`ATTACHED ${filename} (${bytes} bytes) for ${tool}`);
+    return {
+      ...result,
+      content: [{ ...only, attach: { filename, marker, mediaType: mediaTypeFor(source) } }],
+    };
+  }
+
   private async onCallTool(msg: CallToolMessage): Promise<void> {
     const { registry, policy, log } = this.deps;
 
@@ -372,8 +427,16 @@ class Session {
       }
 
       log.audit(`RUN ${descriptor.name} from ${origin} — ${registry.summarize(msg.name, args)}`);
-      const result = await registry.call(msg.name, args, origin, controller.signal, workspace);
-      this.send({ kind: "result", id, result });
+      const result = await registry.call(
+        msg.name,
+        args,
+        origin,
+        controller.signal,
+        workspace,
+        this.resultBudget(msg),
+        msg.canAttach === true,
+      );
+      this.send({ kind: "result", id, result: this.markAttachable(result, id, descriptor.name, args, msg) });
     } catch (err) {
       const { code, message } = classify(err);
       log.audit(`FAILED ${descriptor.name}: ${message}`);
@@ -382,6 +445,76 @@ class Session {
       this.inflight.delete(id);
     }
   }
+}
+
+/** Tool names and call ids are ours, not the page's — this is belt and braces
+ *  so a filename can never carry a path separator into the host's uploader. */
+function safeName(value: string): string {
+  return value.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 40) || "result";
+}
+
+/**
+ * What the attachment is *of*, taken from the call's own arguments.
+ *
+ * Deliberately not `safeName`: that strips everything outside `[A-Za-z0-9_-]`,
+ * which would turn `漢検漢字辞典漢字.csv` into a row of dashes and lose exactly
+ * the information this exists to carry. The name is a filename, not an
+ * identifier, so the rule is to remove what a filesystem or an uploader cannot
+ * take — separators, control characters, the Windows-reserved set — and keep
+ * every other character as the user wrote it.
+ */
+function sourceName(tool: string, args: Record<string, unknown>): string {
+  const raw =
+    typeof args.path === "string"
+      ? args.path
+      : typeof args.command === "string"
+        ? args.command
+        : "";
+
+  const base = raw.split(/[\\/]/).pop() ?? "";
+  const cleaned = base
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u001f\u007f]/g, "")
+    .replace(/[<>:"|?*]/g, "-")
+    .trim();
+
+  // Capped so a deeply-named file cannot produce a filename an uploader
+  // refuses, and so the chip has a chance of rendering it in full.
+  const capped = cleaned.slice(0, 60);
+
+  // No source file — `fs_list`, `exec_run` — so the body is the daemon's own
+  // rendered text and `.md` describes it honestly.
+  if (capped === "") return `${safeName(tool)}.md`;
+  // A name with no extension at all is refused by some uploaders, and the
+  // content genuinely is text.
+  return /\.[^.]+$/.test(capped) ? capped : `${capped}.txt`;
+}
+
+/**
+ * The media type the *source* extension implies.
+ *
+ * Attachments used to be `text/markdown` whatever they held, which was true
+ * only because everything was renamed `.md` first. Now that a CSV arrives as a
+ * CSV, saying so is what lets the host treat it as one.
+ */
+const MEDIA_TYPES: Record<string, string> = {
+  ".md": "text/markdown",
+  ".markdown": "text/markdown",
+  ".csv": "text/csv",
+  ".tsv": "text/tab-separated-values",
+  ".json": "application/json",
+  ".html": "text/html",
+  ".htm": "text/html",
+  ".xml": "text/xml",
+  ".yaml": "text/yaml",
+  ".yml": "text/yaml",
+};
+
+function mediaTypeFor(filename: string): string {
+  const dot = filename.lastIndexOf(".");
+  // Everything the tools can read is UTF-8 text, so an unknown extension is
+  // `text/plain` rather than a refusal or a guess at something binary.
+  return (dot === -1 ? undefined : MEDIA_TYPES[filename.slice(dot).toLowerCase()]) ?? "text/plain";
 }
 
 function classify(err: unknown): { code: ErrorCode; message: string } {

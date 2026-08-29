@@ -36,6 +36,18 @@ export interface ExecConfig {
 export interface Limits {
   /** Reads longer than this are truncated — the result is pasted into the chat. */
   maxReadBytes: number;
+  /**
+   * Ceiling for a result the caller will *upload* instead of pasting.
+   *
+   * Applies only when the page said it can attach a file, and it replaces
+   * `maxReadBytes` for that call rather than adding to it. Pasting is what the
+   * small cap protects against — a rich-text composer given tens of thousands
+   * of characters freezes the tab — and none of that applies to a file, so the
+   * budget above it is about how much output is useful in a chat, not about
+   * safety. Keep it finite anyway: the whole result crosses one WebSocket
+   * frame and sits in memory at both ends.
+   */
+  maxAttachBytes: number;
   maxWriteBytes: number;
   maxListEntries: number;
   /** How long a human has to answer an approval prompt before it auto-denies. */
@@ -96,6 +108,7 @@ const DEFAULTS = {
   },
   limits: {
     maxReadBytes: 64 * 1024,
+    maxAttachBytes: 1024 * 1024,
     maxWriteBytes: 1024 * 1024,
     maxListEntries: 500,
     approvalTimeoutMs: 120_000,
@@ -251,6 +264,7 @@ export async function loadConfig(overrides: ConfigOverrides = {}): Promise<Confi
     },
     limits: {
       maxReadBytes: asNumber(limitsRaw.maxReadBytes) ?? DEFAULTS.limits.maxReadBytes,
+      maxAttachBytes: asNumber(limitsRaw.maxAttachBytes) ?? DEFAULTS.limits.maxAttachBytes,
       maxWriteBytes: asNumber(limitsRaw.maxWriteBytes) ?? DEFAULTS.limits.maxWriteBytes,
       maxListEntries: asNumber(limitsRaw.maxListEntries) ?? DEFAULTS.limits.maxListEntries,
       approvalTimeoutMs: asNumber(limitsRaw.approvalTimeoutMs) ?? DEFAULTS.limits.approvalTimeoutMs,

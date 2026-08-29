@@ -34,6 +34,20 @@ export interface CallToolMessage {
   args: Record<string, unknown>;
   /** Host page the call was observed on, for the approval prompt and audit log. */
   origin: string;
+  /**
+   * This page can upload a file, so an oversized result may come back whole
+   * and be attached instead of pasted and truncated.
+   *
+   * Read this as a statement about the *page*, not a request for permission,
+   * because it is the one field here a hostile page can influence and it must
+   * be harmless if it lies. It cannot reach anything the caller could not
+   * already reach: the jail, the approval and the tool are all decided without
+   * it, and a page that already has `fs_read` can page through a whole file
+   * with `offset` regardless. All it changes is how many of those bytes come
+   * back in one message, and that stays bounded by `limits.maxAttachBytes`
+   * from the daemon's own config file.
+   */
+  canAttach?: boolean;
 }
 
 /**
@@ -195,7 +209,14 @@ export type ServerToClientMessage =
  */
 export type PageRequest =
   | { kind: "page_list_tools" }
-  | { kind: "page_call_tool"; callId: string; name: string; args: Record<string, unknown> }
+  | {
+      kind: "page_call_tool";
+      callId: string;
+      name: string;
+      args: Record<string, unknown>;
+      /** True when this host has a file input we could upload a big result to. */
+      canAttach?: boolean;
+    }
   | { kind: "page_status" }
   /**
    * The content script telling the worker something went wrong in the DOM, so
@@ -234,8 +255,16 @@ export interface PageDiagnostics {
   /** Human-readable description of the element found, or null if none was. */
   composer: string | null;
   submitButton: string | null;
+  /** The upload input a too-large result would go to, or null if there is none. */
+  fileInput: string | null;
   streaming: boolean;
   codeBlocks: number;
+  /**
+   * Calls the scanner deliberately did not run — they were already on screen
+   * when it attached, or they had gone stale. The number that answers "why did
+   * nothing happen when I reopened this tab", which is otherwise invisible.
+   */
+  skippedCalls: number;
   /** What the fence scanner currently sees, which is the whole game when a
    *  call is emitted but never runs. */
   blocks: {

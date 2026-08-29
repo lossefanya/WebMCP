@@ -79,6 +79,8 @@ export class Registry {
     origin: string,
     signal: AbortSignal,
     workspace: Workspace,
+    maxResultBytes: number,
+    canAttach = false,
   ): Promise<ToolResult> {
     const builtin = this.builtins.get(name);
     if (builtin) {
@@ -87,6 +89,8 @@ export class Registry {
         config: this.config,
         origin,
         signal,
+        maxResultBytes,
+        canAttach,
       };
       return builtin.run(args, ctx);
     }

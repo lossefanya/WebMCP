@@ -43,7 +43,7 @@ describe("Registry", () => {
   it("reports an unknown tool as unknown rather than throwing something opaque", async () => {
     const { registry } = build();
     await expect(
-      registry.call("nope__missing", {}, "test", new AbortController().signal, fixture.workspace),
+      registry.call("nope__missing", {}, "test", new AbortController().signal, fixture.workspace, 64 * 1024),
     ).rejects.toThrow(/unknown tool/);
   });
 

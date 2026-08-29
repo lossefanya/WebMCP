@@ -53,6 +53,7 @@ export function testConfig(root: string, overrides: Partial<Config> = {}): Confi
     },
     limits: {
       maxReadBytes: 4_096,
+      maxAttachBytes: 256 * 1_024,
       maxWriteBytes: 1_024 * 1_024,
       maxListEntries: 100,
       approvalTimeoutMs: 1_000,
@@ -65,7 +66,14 @@ export function testConfig(root: string, overrides: Partial<Config> = {}): Confi
 }
 
 export function testContext(workspace: Workspace, config: Config): ToolContext {
-  return { workspace, config, origin: "https://example.test", signal: new AbortController().signal };
+  return {
+    workspace,
+    config,
+    origin: "https://example.test",
+    signal: new AbortController().signal,
+    maxResultBytes: config.limits.maxReadBytes,
+    canAttach: false,
+  };
 }
 
 export const silentLogger: Logger = {

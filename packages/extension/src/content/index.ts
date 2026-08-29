@@ -8,13 +8,18 @@ import {
   collectFromBlocks,
   hash,
   looksLikeToolCall,
+  renderAttachedResult,
   renderPreamble,
   renderToolError,
   renderToolResult,
 } from "@webmcp/protocol";
 import { adapterForHost } from "./adapters/index.js";
 import { type WrappedAdapter, turnsToScan, withFallbacks } from "./adapters/heuristics.js";
+import type { ToolResult } from "@webmcp/protocol";
+import type { PendingAttachment } from "./attach.js";
 import { insertAndSubmit } from "./compose.js";
+import { CallGate, MAX_CALL_AGE_MS } from "./gate.js";
+import { CallHistory } from "./history.js";
 import { blocksFromTurn } from "./serialize.js";
 
 /**
@@ -51,13 +56,22 @@ const BUSY_RETRY_MS = 1_500;
 const BUSY_RETRY_LIMIT = 20;
 /** Safety-net rescan, independent of the mutation observer. */
 const POLL_MS = 1_500;
+/**
+ * How much of an oversized result to paste when its upload failed.
+ *
+ * Well under the daemon's own paste budget, because arriving here means the
+ * result was over that budget in the first place and the whole reason for the
+ * upload was that pasting this much text is what wedges the tab. The model is
+ * told to page the rest with `offset`.
+ */
+const FALLBACK_PASTE_CHARS = 16_000;
 
 
 class Runner {
-  /** Blocks already dispatched, so a re-render is not a second execution. */
-  private readonly handled = new Set<string>();
-  /** Block key -> {text, firstSeen}, for the stability check. */
-  private readonly seen = new Map<string, { text: string; at: number }>();
+  /** De-duplication, seeding and freshness. See `gate.ts`. */
+  private readonly gate = new CallGate(Date.now());
+  /** What earlier sessions in this same conversation already dispatched. */
+  private readonly history = new CallHistory(CallHistory.threadKey(location));
   private queue: Promise<void> = Promise.resolve();
   private observer: MutationObserver | undefined;
   private timer: number | undefined;
@@ -70,6 +84,10 @@ class Runner {
   constructor(private readonly site: WrappedAdapter) {}
 
   async attach(): Promise<void> {
+    // Before anything is scanned. Starting to scan first would race the load and
+    // re-run the very calls this is here to remember.
+    this.gate.remember(await this.history.load());
+
     const root = await this.waitForRoot();
     this.observer = new MutationObserver(() => this.schedule());
     this.observer.observe(root, { childList: true, subtree: true, characterData: true });
@@ -110,6 +128,7 @@ class Runner {
       return;
     }
     const streaming = this.site.isStreaming();
+
     // Filtered again here, not only in the adapter wrapper: a tool call found
     // inside a user turn is one the model never made — it is the preamble's own
     // example, or a pasted-back result — and running it is a correctness bug no
@@ -119,7 +138,12 @@ class Runner {
     // walk per marker — filtering the whole conversation first made every scan
     // more expensive as the chat grew, which is how an extension makes a chat UI
     // stop keeping up part-way through a session.
-    for (const turn of turnsToScan(this.site.assistantTurns())) {
+    const turns = turnsToScan(this.site.assistantTurns());
+    // Anything already on screen is from before this scanner existed: the user
+    // reopened a tab, they did not ask for the transcript to be replayed.
+    const seeding = this.gate.beginScan(turns.length > 0);
+
+    for (const turn of turns) {
       const { blocks, source } = blocksFromTurn(turn, streaming);
       this.lastBlocks = blocks;
 
@@ -132,14 +156,19 @@ class Runner {
         includeUnclosed: source === "dom",
       });
 
-      const unclosed = new Set(
-        blocks.filter((b) => !b.closed).map((b) => `call:${hash(b.body)}`),
-      );
+      const unclosed = new Set(blocks.filter((b) => !b.closed).map((b) => hash(b.body)));
 
       for (const error of errors) {
-        const key = `err:${hash(error.raw)}`;
-        if (this.handled.has(key)) continue;
-        this.handled.add(key);
+        // Settled like a call, and for the same reason: a block still being
+        // typed passes through a great many states that are not valid JSON, and
+        // answering each of them fills the conversation with complaints about a
+        // call the model has not finished writing.
+        const verdict = this.gate.admit(`err:${hash(error.raw)}`, error.raw, STABLE_MS, seeding);
+        if (verdict === "settling") {
+          this.reschedule(STABLE_MS);
+          continue;
+        }
+        if (verdict !== "run") continue;
         this.enqueue(() =>
           this.deliver(
             renderToolError(
@@ -154,33 +183,47 @@ class Runner {
 
       for (const call of calls) {
         const key = `call:${hash(call.raw)}`;
-        if (this.handled.has(key)) continue;
-        const settle = unclosed.has(key) ? UNCLOSED_STABLE_MS : STABLE_MS;
-        if (!this.isStable(key, call.raw, settle)) continue;
-        this.handled.add(key);
-        this.enqueue(() => this.dispatch(call.id, call.tool, call.args));
+        const settle = unclosed.has(hash(call.raw)) ? UNCLOSED_STABLE_MS : STABLE_MS;
+
+        switch (this.gate.admit(key, call.raw, settle, seeding)) {
+          case "run":
+            // Recorded at dispatch, not at completion. A call that was sent and
+            // then abandoned — the daemon dropped, the tab closed — must not be
+            // retried on the next page load; that is the failure this exists
+            // for.
+            void this.history.record(key);
+            this.enqueue(() => this.dispatch(call.id, call.tool, call.args));
+            break;
+          case "already-run":
+            this.report(
+              "warn",
+              `skipped a ${call.tool} call this extension already ran ` +
+                `${ago(this.history.ranAt(key))} — ask again if you want it repeated`,
+            );
+            break;
+          case "settling":
+            // Re-scan once the window can actually have elapsed: after the last
+            // token there are no more mutations, so nothing else would wake the
+            // scanner up again.
+            this.reschedule(settle);
+            break;
+          case "history":
+            console.debug(`[webmcp] not running ${call.tool} — it predates this page load`);
+            break;
+          case "stale":
+            // Said out loud. A call silently not running looks identical to a
+            // daemon that is not connected, and the user has no way to tell.
+            this.report(
+              "warn",
+              `skipped a ${call.tool} call that sat unrun for more than ` +
+                `${Math.round(MAX_CALL_AGE_MS / 1000)}s — ask again if you still want it`,
+            );
+            break;
+          case "duplicate":
+            break;
+        }
       }
     }
-  }
-
-  /**
-   * Second guard behind the closing fence. A JSON object can be *valid* while
-   * still incomplete — `{"tool":"fs_write"}` parses fine before `args` arrives —
-   * so a block also has to stop changing before it is allowed to run.
-   */
-  private isStable(key: string, text: string, settleMs: number): boolean {
-    const now = Date.now();
-    const previous = this.seen.get(key);
-    if (!previous || previous.text !== text) {
-      this.seen.set(key, { text, at: now });
-      this.reschedule(settleMs);
-      return false;
-    }
-    if (now - previous.at < settleMs) {
-      this.reschedule(settleMs);
-      return false;
-    }
-    return true;
   }
 
   /**
@@ -197,10 +240,13 @@ class Runner {
   }
 
   /** One call at a time: the results are pasted into a single shared composer. */
-  private enqueue(task: () => Promise<void>): void {
-    this.queue = this.queue.then(task).catch((err: unknown) => {
-      console.warn("[webmcp]", err);
-    });
+  private enqueue(task: () => Promise<unknown>): void {
+    this.queue = this.queue
+      .then(task)
+      .then(() => undefined)
+      .catch((err: unknown) => {
+        console.warn("[webmcp]", err);
+      });
   }
 
   private async dispatch(
@@ -208,10 +254,15 @@ class Runner {
     tool: string,
     args: Record<string, unknown>,
   ): Promise<void> {
-    const reply = await ask({ kind: "page_call_tool", callId, name: tool, args });
+    // Asked of the live DOM at call time, not cached at startup: the answer is
+    // "does this page have an uploader right now", and these are SPAs. It only
+    // tells the daemon whether an oversized result is worth sending whole —
+    // the daemon still decides what may be read at all.
+    const canAttach = this.site.fileInput() !== null || this.site.uploadTrigger() !== null;
+    const reply = await ask({ kind: "page_call_tool", callId, name: tool, args, canAttach });
 
     if (reply.kind === "page_result") {
-      await this.deliver(renderToolResult(callId, tool, reply.result));
+      await this.deliverResult(callId, tool, reply.result);
       return;
     }
     const message = reply.kind === "page_error" ? reply.message : "no response from WebMCP";
@@ -219,25 +270,70 @@ class Runner {
   }
 
   /**
+   * Put a result into the conversation, as an upload when the daemon marked it
+   * too large to paste.
+   *
+   * The fallback is the point. An upload can fail for reasons nothing here can
+   * see — the host rejected the type, the user is logged out, the input moved —
+   * and every one of them has to end in the model getting *something*, so a
+   * failure degrades to the shortened paste that was the only behaviour before
+   * uploads existed.
+   */
+  private async deliverResult(callId: string, tool: string, result: ToolResult): Promise<void> {
+    const only = result.content.length === 1 ? result.content[0] : undefined;
+    const attach = only?.attach;
+
+    if (only && attach) {
+      const bytes = new TextEncoder().encode(only.text).length;
+      const sent = await this.deliver(
+        renderAttachedResult(callId, tool, attach.filename, bytes, only.truncated === true),
+        {
+          filename: attach.filename,
+          marker: attach.marker,
+          mediaType: attach.mediaType,
+          body: only.text,
+        },
+      );
+      if (sent) return;
+      this.report(
+        "warn",
+        `could not upload ${attach.filename} (${bytes} bytes) — pasting a shortened result instead`,
+      );
+      await this.deliver(renderToolResult(callId, tool, shorten(result)));
+      return;
+    }
+
+    await this.deliver(renderToolResult(callId, tool, result));
+  }
+
+  /**
    * Paste a turn back into the conversation. If the user is mid-sentence in the
    * composer we wait rather than overwrite what they typed.
    */
-  private async deliver(text: string): Promise<void> {
+  private async deliver(text: string, attachment?: PendingAttachment): Promise<boolean> {
     for (let attempt = 0; attempt < BUSY_RETRY_LIMIT; attempt++) {
-      const outcome = await insertAndSubmit(this.site, text);
+      const outcome = await insertAndSubmit(this.site, text, attachment);
       if (outcome.status === "sent") {
         this.lastError = null;
-        return;
+        return true;
       }
       // "busy" and "streaming" are both "try again shortly", not failures.
       if (outcome.status === "busy" || outcome.status === "streaming") {
         await sleep(BUSY_RETRY_MS);
         continue;
       }
+      // Reported by the caller, not here: a failed upload has a fallback, and
+      // announcing it as an error before the fallback has run would say the
+      // delivery failed when it is about to succeed as a shortened paste.
+      if (outcome.status === "attach_failed") {
+        console.warn(`[webmcp] ${outcome.detail}`);
+        return false;
+      }
       this.report("error", `${outcome.status}: ${outcome.detail}`);
-      return;
+      return false;
     }
     this.report("warn", "gave up waiting for the composer to be free");
+    return false;
   }
 
   /** Stop watching. Called once the extension is reloaded out from under us. */
@@ -262,6 +358,8 @@ class Runner {
     const root = this.site.conversationRoot();
     const composer = this.site.composer();
     const submit = this.site.submitButton();
+    const fileInput = this.site.fileInput();
+    const uploadTrigger = this.site.uploadTrigger();
     const fallbacks = [...this.site.fellBackOn];
     // Force a scan so the block list reflects the page as it is right now
     // rather than whenever the last mutation happened to land.
@@ -274,8 +372,14 @@ class Runner {
       assistantTurns: this.site.assistantTurns().length,
       composer: composer ? describe(composer) : null,
       submitButton: submit ? describe(submit) : null,
+      fileInput: fileInput
+        ? describe(fileInput)
+        : uploadTrigger
+          ? `behind ${describe(uploadTrigger)}`
+          : null,
       streaming: this.site.isStreaming(),
       codeBlocks: document.querySelectorAll("main pre, pre").length,
+      skippedCalls: this.gate.skipped,
       blocks: this.lastBlocks.map((b) => ({
         tag: b.tag,
         closed: b.closed,
@@ -358,6 +462,48 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * How long ago, in words. Exists because "30 seconds ago" and "two days ago"
+ * are the difference between a call worth retrying and one that has already
+ * been answered further down the conversation — and the page itself cannot tell
+ * anyone which it is.
+ */
+function ago(at: number | null): string {
+  if (at === null) return "earlier";
+  const seconds = Math.max(0, Math.round((Date.now() - at) / 1000));
+  if (seconds < 90) return `${seconds}s ago`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 90) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  return hours < 36 ? `${hours}h ago` : `${Math.round(hours / 24)}d ago`;
+}
+
+/**
+ * Cut an oversized result down to something safe to paste.
+ *
+ * Only ever reached when an upload failed, so it is the second-best answer by
+ * construction — but it has to name the shortfall, because a result that is
+ * quietly missing most of a file reads to the model as a complete one.
+ */
+function shorten(result: ToolResult): ToolResult {
+  return {
+    ...result,
+    content: result.content.map((part) => {
+      if (part.text.length <= FALLBACK_PASTE_CHARS) return part;
+      return {
+        ...part,
+        attach: undefined,
+        truncated: true,
+        text:
+          part.text.slice(0, FALLBACK_PASTE_CHARS) +
+          `\n\n[webmcp: the full result could not be uploaded, so this shows the first ` +
+          `${FALLBACK_PASTE_CHARS} of ${part.text.length} characters. ` +
+          `Page through the rest with the tool's offset argument.]`,
+      };
+    }),
+  };
+}
+
 const site = adapterForHost(location.host);
 const runner = site ? new Runner(withFallbacks(site)) : null;
 
@@ -403,8 +549,10 @@ function emptyDiagnostics(): PageDiagnostics {
     assistantTurns: 0,
     composer: null,
     submitButton: null,
+    fileInput: null,
     streaming: false,
     codeBlocks: document.querySelectorAll("pre").length,
+    skippedCalls: 0,
     blocks: [],
     lastError: `no WebMCP adapter claims ${location.host}`,
   };

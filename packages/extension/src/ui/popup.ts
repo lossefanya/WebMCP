@@ -336,8 +336,10 @@ function showReport(report: PageDiagnostics): void {
     `turns       ${report.assistantTurns}`,
     `composer    ${report.composer ?? "MISSING"}`,
     `send button ${report.submitButton ?? "MISSING"}`,
+    `file input  ${report.fileInput ?? "none — big results are pasted, not uploaded"}`,
     `streaming   ${report.streaming}`,
     `code blocks ${report.codeBlocks}`,
+    `skipped     ${report.skippedCalls} (already on screen when WebMCP attached, or stale)`,
   ];
   if (report.blocks.length) {
     rows.push(``, `code blocks the scanner sees:`);

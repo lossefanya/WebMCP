@@ -161,7 +161,12 @@ async function handlePageRequest(
           ? message.args
           : {};
       try {
-        const result = await connection.callTool(String(message.name), args, origin);
+        const result = await connection.callTool(
+          String(message.name),
+          args,
+          origin,
+          message.canAttach === true,
+        );
         return { kind: "page_result", callId: message.callId, result };
       } catch (err) {
         return { kind: "page_error", callId: message.callId, message: (err as Error).message };

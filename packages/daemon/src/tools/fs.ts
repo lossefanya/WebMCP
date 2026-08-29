@@ -2,7 +2,7 @@ import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { JailViolation } from "../jail.js";
-import { truncate } from "../text.js";
+import { sliceBytes, truncate } from "../text.js";
 import {
   type Tool,
   type ToolContext,
@@ -40,10 +40,21 @@ const fsRead: Tool = {
     const limit = optionalNumber(args, "limit");
     if (offset < 1) throw new ToolError(`"offset" is 1-based, got ${offset}`);
 
-    const maxBytes = ctx.config.limits.maxReadBytes;
+    const maxBytes = ctx.maxResultBytes;
     const { handle, path: jailed, size } = await ctx.workspace.openRead(requested);
     try {
       const range = await readLineRange(handle, size, offset, limit, maxBytes);
+
+      // Going up as a file rather than into the message, so hand back the file
+      // and nothing else. The path and the size are already in the covering
+      // message and in the attachment's own name; repeating them as a first
+      // line *inside* the file is corruption — a CSV gains a bogus row, a JSON
+      // file stops parsing — and it is the reason attachments used to be
+      // renamed to `.md` rather than keeping the name they were read under.
+      if (ctx.canAttach && size > ctx.config.limits.maxReadBytes) {
+        return text(range.text, { truncated: range.more, originalBytes: size });
+      }
+
       const header = `${jailed.display} (${size} bytes)\n`;
 
       // Asking past the end is a real answer, not an empty one. Returning a bare
@@ -62,10 +73,16 @@ const fsRead: Tool = {
       // internal read cap as the denominator, which understated a 271KB file as
       // 4096 bytes and read as "you have half of it".
       const last = offset + range.lines - 1;
-      const footer = range.more
-        ? `\n[webmcp: showed lines ${offset}-${last} of ${jailed.display} (${size} bytes).` +
-          ` Continue with {"path": "${requested}", "offset": ${last + 1}}]`
-        : "";
+      // A line longer than the whole budget gets a different note, because the
+      // usual one would be a lie: `offset: last + 1` resumes at the *next* line
+      // and the rest of this one is not reachable that way at all.
+      const footer = range.cutLine
+        ? `\n[webmcp: line ${last} of ${jailed.display} is longer than the ${maxBytes}-byte` +
+          ` result budget and was cut. Paging with offset cannot recover the rest of it]`
+        : range.more
+          ? `\n[webmcp: showed lines ${offset}-${last} of ${jailed.display} (${size} bytes).` +
+            ` Continue with {"path": "${requested}", "offset": ${last + 1}}]`
+          : "";
 
       return text(header + range.text + footer, {
         truncated: range.more,
@@ -99,7 +116,14 @@ async function readLineRange(
   startLine: number,
   limit: number | undefined,
   maxBytes: number,
-): Promise<{ text: string; lines: number; more: boolean; totalLines: number | null }> {
+): Promise<{
+  text: string;
+  lines: number;
+  more: boolean;
+  /** The first line was itself over budget and had to be cut mid-line. */
+  cutLine: boolean;
+  totalLines: number | null;
+}> {
   const decoder = new StringDecoder("utf8");
   const out: string[] = [];
   let pos = 0;
@@ -107,6 +131,7 @@ async function readLineRange(
   let carry = "";
   let outBytes = 0;
   let more = false;
+  let cutLine = false;
   let done = false;
 
   /** Returns true when the caller should stop scanning. */
@@ -117,8 +142,21 @@ async function readLineRange(
       return true;
     }
     const bytes = Buffer.byteLength(lineText, "utf8");
-    // Always emit at least one line, even a pathologically long one, so a file
-    // of one huge line is not silently unreadable.
+    // Always emit something, even for a pathologically long line, so a file of
+    // one huge line is not silently unreadable — but emit it *cut to budget*.
+    //
+    // This used to push the whole line on the reasoning that one line is the
+    // minimum useful answer. It meant the budget did not apply to it at all: a
+    // 271KB minified file is a single line, so `maxReadBytes` was ignored and
+    // the entire thing was pasted into the composer. That is the case this cap
+    // exists for, and it was the one case that escaped it.
+    if (out.length === 0 && bytes > maxBytes) {
+      out.push(sliceBytes(lineText, maxBytes));
+      outBytes += maxBytes;
+      more = true;
+      cutLine = true;
+      return true;
+    }
     if (out.length > 0 && outBytes + bytes > maxBytes) {
       more = true;
       return true;
@@ -161,6 +199,7 @@ async function readLineRange(
     lines: out.length,
     // More remains if the scan stopped early, or if it stopped at EOF mid-file.
     more: more || (!reachedEof && out.length > 0),
+    cutLine,
     totalLines: reachedEof && !done ? line - 1 : null,
   };
 }
@@ -283,7 +322,7 @@ const fsList: Tool = {
 
     await walk(jailed.real, "");
     const body = `${jailed.display}/\n${rows.join("\n")}${hitLimit ? `\n[webmcp: stopped at ${max} entries]` : ""}`;
-    const cut = truncate(body, ctx.config.limits.maxReadBytes);
+    const cut = truncate(body, ctx.maxResultBytes);
     return text(cut.text, { truncated: cut.truncated, originalBytes: cut.originalBytes });
   },
 };

@@ -13,6 +13,7 @@
  *   node scripts/probe.mjs call fs_read '{"path":"README.md"}'
  *   node scripts/probe.mjs call exec_run '{"command":"git","args":["status"]}'
  *   node scripts/probe.mjs --port 8792 --deny call fs_write '{"path":"x","content":"y"}'
+ *   node scripts/probe.mjs --attach call fs_read '{"path":"big.txt"}'   # oversized -> marked for upload
  *
  * Approval prompts are answered on stdin unless --allow/--deny is passed.
  */
@@ -41,6 +42,9 @@ const bool = (name) => {
 };
 
 const auto = bool("--allow") ? "allow_once" : bool("--deny") ? "deny" : null;
+// Claim what a chat page with a file input claims, so an oversized result comes
+// back whole and marked for upload instead of truncated to the paste budget.
+const canAttach = bool("--attach");
 const port = Number(flag("--port", process.env.WEBMCP_PORT ?? 8767));
 const tokenFile = flag("--token-file", path.join(projectRoot, ".webmcp", "token"));
 const origin = flag("--origin", "https://chatgpt.com");
@@ -49,7 +53,7 @@ const [command, toolName, argsJson] = args;
 // `workspace` takes a directory where `call` takes a tool name — same slot.
 if (!command || ((command === "call" || command === "workspace") && !toolName)) {
   process.stderr.write(
-    "usage: probe.mjs [--port N] [--allow|--deny] tools | roots | workspace <dir> | call <tool> [json]\n",
+    "usage: probe.mjs [--port N] [--allow|--deny] [--attach] tools | roots | workspace <dir> | call <tool> [json]\n",
   );
   process.exit(2);
 }
@@ -76,7 +80,11 @@ const socket = new WebSocket(`ws://127.0.0.1:${port}`);
 const send = (message) => socket.send(JSON.stringify(message));
 const done = (code) => {
   socket.close();
-  process.exit(code);
+  // Not `process.exit`. Writing a large result and exiting immediately truncates
+  // stdout when it is a pipe, which quietly turned a 200KB read into whatever
+  // fitted in the buffer — exactly the measurement this script exists to make.
+  // Setting the code and letting the socket close drains the write first.
+  process.exitCode = code;
 };
 
 const timeout = setTimeout(() => {
@@ -111,7 +119,7 @@ socket.addEventListener("message", async (event) => {
       // The popup's route, driven by hand. The daemon refuses anything that is
       // not a granted root, so this is also how you check that it does.
       else if (command === "workspace") send({ kind: "set_workspace", id: "1", root: toolName });
-      else send({ kind: "call_tool", id: "1", name: toolName, args: toolArgs, origin });
+      else send({ kind: "call_tool", id: "1", name: toolName, args: toolArgs, origin, canAttach });
       return;
 
     case "workspace_changed":
@@ -136,7 +144,19 @@ socket.addEventListener("message", async (event) => {
     }
 
     case "result":
-      for (const part of message.result.content) process.stdout.write(`${part.text}\n`);
+      for (const part of message.result.content) {
+        // Printed rather than the body: with --attach an oversized result comes
+        // back whole, and dumping a megabyte into the terminal is not the thing
+        // being checked.
+        if (part.attach) {
+          process.stdout.write(
+            `[webmcp: ${part.text.length} chars, marked for upload as ${part.attach.filename}` +
+              ` (${part.attach.mediaType})]\n`,
+          );
+          continue;
+        }
+        process.stdout.write(`${part.text}\n`);
+      }
       done(message.result.isError ? 1 : 0);
       return;
 

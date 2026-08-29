@@ -279,7 +279,12 @@ export class DaemonConnection {
     });
   }
 
-  callTool(name: string, args: Record<string, unknown>, origin: string): Promise<ToolResult> {
+  callTool(
+    name: string,
+    args: Record<string, unknown>,
+    origin: string,
+    canAttach = false,
+  ): Promise<ToolResult> {
     const id = `c${this.nextId++}`;
     return new Promise<ToolResult>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -294,7 +299,7 @@ export class DaemonConnection {
 
       this.waiters.set(id, { resolve, reject, timer });
       try {
-        this.send({ kind: "call_tool", id, name, args, origin });
+        this.send({ kind: "call_tool", id, name, args, origin, canAttach });
       } catch (err) {
         clearTimeout(timer);
         this.waiters.delete(id);

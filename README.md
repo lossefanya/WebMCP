@@ -82,7 +82,10 @@ settings below grants rather than suggestions.
   more; when a command is killed, the result says so and names the ceiling to retry with.
 - `mcpServers` — `claude_desktop_config.json` blocks verbatim, so you can paste ones you already have.
 
-A `limits` block tunes read/write ceilings and the approval timeout; see `CLAUDE.md` for those.
+A `limits` block tunes read/write ceilings and the approval timeout; see `CLAUDE.md` for those. One
+of them is worth knowing about here: `limits.maxAttachBytes` (1 MiB) is the ceiling for a result the
+page will *upload* rather than paste, which is how a file too large for the chat box still arrives
+whole.
 
 **The daemon watches this file.** Change `workspace`, save, and a running daemon moves within about a
 second — no restart, no re-pairing. `--set-workspace` is just a wrapper that makes that edit for you:
@@ -107,7 +110,21 @@ into objects built at startup, so changing those still needs a restart.
   a rebuilt environment that does not include your shell's secrets.
 - Downstream MCP servers reach the network by nature. Enabling one is its own consent decision,
   separate from the filesystem grant.
+- **Tool calls already on screen are never run.** Reopening a chat, reloading the page or reloading
+  the extension does not replay the calls in the transcript — only calls that appear while WebMCP is
+  watching are executed, and one that has sat unrun for more than 30 seconds is skipped and reported
+  rather than run late. Every call this extension dispatches is also remembered per conversation for
+  a week, so a call it has already run is never run a second time even if the page is reloaded.
 - Tool output is pasted into the visible conversation, so it is context the model pays for. Large
-  reads are truncated rather than dumped.
+  reads are truncated rather than dumped — 64 KiB by default (`limits.maxReadBytes`), including a
+  single line longer than that, which is cut rather than pasted whole.
+- **A result too large to paste is uploaded instead, where the host allows it.** Typing a big file
+  into these composers freezes the tab, so past the paste budget the same bytes go up through the
+  page's own file-upload control — as the file itself, keeping the name and type it was read under
+  (`webmcp-c2-notes.csv`) — and the message says to read the attachment. Wired for all four hosts — on Gemini the extension has to open the "Upload and tools"
+  menu first, because the file input does not exist until it does, and it closes the menu again
+  afterwards. If the upload is not confirmed it falls back to pasting a shortened result, as before. The upload
+  goes to the same chat service the text would have, so it is not a new destination, and the daemon
+  logs an `ATTACHED` line for every one.
 
 See `CLAUDE.md` for the architecture, the security invariants, and the full command reference.
