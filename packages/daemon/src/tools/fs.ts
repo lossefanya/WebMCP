@@ -1,7 +1,8 @@
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import { JailViolation } from "../jail.js";
-import { truncate, truncateLines } from "../text.js";
+import { truncate } from "../text.js";
 import {
   type Tool,
   type ToolContext,
@@ -39,29 +40,130 @@ const fsRead: Tool = {
     const limit = optionalNumber(args, "limit");
     if (offset < 1) throw new ToolError(`"offset" is 1-based, got ${offset}`);
 
+    const maxBytes = ctx.config.limits.maxReadBytes;
     const { handle, path: jailed, size } = await ctx.workspace.openRead(requested);
     try {
-      // Read at most twice the paste budget: enough to slice lines from, small
-      // enough that a huge file never lands in memory.
-      const cap = ctx.config.limits.maxReadBytes * 2;
-      const buf = Buffer.alloc(Math.min(size, cap));
-      const { bytesRead } = await handle.read(buf, 0, buf.length, 0);
-      let body = buf.subarray(0, bytesRead).toString("utf8");
+      const range = await readLineRange(handle, size, offset, limit, maxBytes);
+      const header = `${jailed.display} (${size} bytes)\n`;
 
-      if (offset > 1 || limit !== undefined) {
-        const lines = body.split("\n");
-        const start = offset - 1;
-        body = lines.slice(start, limit === undefined ? undefined : start + limit).join("\n");
+      // Asking past the end is a real answer, not an empty one. Returning a bare
+      // header reads as "the file is empty here", which is what sent a model
+      // round in circles paging a file it had already finished.
+      if (range.lines === 0) {
+        const detail =
+          range.totalLines === null
+            ? `no lines from offset ${offset}`
+            : `offset ${offset} is past the end — ${jailed.display} has ${range.totalLines} lines`;
+        return text(`${header}[webmcp: ${detail}]`, { truncated: false, originalBytes: size });
       }
 
-      const cut = truncateLines(body, ctx.config.limits.maxReadBytes);
-      const header = `${jailed.display} (${size} bytes)\n`;
-      return text(header + cut.text, { truncated: cut.truncated, originalBytes: size });
+      // The footer names where to resume, because "truncated" without a next
+      // offset leaves the model to guess one. The old notice reported the
+      // internal read cap as the denominator, which understated a 271KB file as
+      // 4096 bytes and read as "you have half of it".
+      const last = offset + range.lines - 1;
+      const footer = range.more
+        ? `\n[webmcp: showed lines ${offset}-${last} of ${jailed.display} (${size} bytes).` +
+          ` Continue with {"path": "${requested}", "offset": ${last + 1}}]`
+        : "";
+
+      return text(header + range.text + footer, {
+        truncated: range.more,
+        originalBytes: size,
+      });
     } finally {
       await handle.close();
     }
   },
 };
+
+/**
+ * Read a range of lines without holding the file in memory.
+ *
+ * The previous implementation read the first `2 * maxReadBytes` from byte zero
+ * and *then* sliced lines out of that buffer, so any line past the cap was
+ * unreachable by any offset — while the tool description told the model to page
+ * through long files with exactly that argument. On a 271KB file with a 4KB cap,
+ * `offset: 100` came back empty with no explanation.
+ *
+ * So the scan walks forward chunk by chunk, counting lines, and stops as soon as
+ * it has what was asked for. `StringDecoder` carries partial UTF-8 sequences
+ * across chunk boundaries — splitting a buffer mid-code-point and decoding each
+ * half independently is how a scan like this corrupts non-ASCII text.
+ */
+const SCAN_CHUNK = 64 * 1024;
+
+async function readLineRange(
+  handle: fsp.FileHandle,
+  size: number,
+  startLine: number,
+  limit: number | undefined,
+  maxBytes: number,
+): Promise<{ text: string; lines: number; more: boolean; totalLines: number | null }> {
+  const decoder = new StringDecoder("utf8");
+  const out: string[] = [];
+  let pos = 0;
+  let line = 1;
+  let carry = "";
+  let outBytes = 0;
+  let more = false;
+  let done = false;
+
+  /** Returns true when the caller should stop scanning. */
+  const take = (lineText: string): boolean => {
+    if (line < startLine) return false;
+    if (limit !== undefined && out.length >= limit) {
+      more = true;
+      return true;
+    }
+    const bytes = Buffer.byteLength(lineText, "utf8");
+    // Always emit at least one line, even a pathologically long one, so a file
+    // of one huge line is not silently unreadable.
+    if (out.length > 0 && outBytes + bytes > maxBytes) {
+      more = true;
+      return true;
+    }
+    out.push(lineText);
+    outBytes += bytes;
+    // The budget is checked before the push, so having pushed we always go on.
+    return false;
+  };
+
+  while (pos < size && !done) {
+    const buf = Buffer.alloc(Math.min(SCAN_CHUNK, size - pos));
+    const { bytesRead } = await handle.read(buf, 0, buf.length, pos);
+    if (bytesRead === 0) break;
+    pos += bytesRead;
+    carry += decoder.write(buf.subarray(0, bytesRead));
+
+    for (;;) {
+      const nl = carry.indexOf("\n");
+      if (nl === -1) break;
+      const lineText = carry.slice(0, nl + 1);
+      carry = carry.slice(nl + 1);
+      if (take(lineText)) {
+        done = true;
+        break;
+      }
+      line++;
+    }
+  }
+
+  // A file whose last line has no trailing newline.
+  carry += decoder.end();
+  const reachedEof = pos >= size;
+  if (!done && carry.length > 0) {
+    if (!take(carry)) line++;
+  }
+
+  return {
+    text: out.join(""),
+    lines: out.length,
+    // More remains if the scan stopped early, or if it stopped at EOF mid-file.
+    more: more || (!reachedEof && out.length > 0),
+    totalLines: reachedEof && !done ? line - 1 : null,
+  };
+}
 
 const fsWrite: Tool = {
   descriptor: {

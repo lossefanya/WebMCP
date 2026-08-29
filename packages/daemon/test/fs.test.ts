@@ -48,10 +48,90 @@ describe("filesystem tools", () => {
     );
     const part = result.content[0]!;
     expect(part.truncated).toBe(true);
-    expect(part.text).toMatch(/truncated/);
+    // The notice now names the range and the resume offset rather than saying
+    // only "truncated", which left the model to guess where to continue.
+    expect(part.text).toMatch(/showed lines 1-\d+ .*Continue with/s);
     // Ends on a line break, so the model never sees half a line.
-    const shown = part.text.split("\n\n[webmcp")[0] ?? "";
+    const shown = part.text.split("\n[webmcp")[0] ?? "";
     expect(shown.endsWith("line of text\n")).toBe(true);
+  });
+
+  describe("paging a long file", () => {
+    const LINES = 3_000;
+    const big = () => Array.from({ length: LINES }, (_, i) => `line ${i} ${"x".repeat(80)}`).join("\n") + "\n";
+    const small = { limits: { maxReadBytes: 2_048, maxWriteBytes: 1_048_576, maxListEntries: 100, approvalTimeoutMs: 1_000, downstreamTimeoutMs: 1_000 } };
+
+    beforeEach(async () => {
+      await fsp.writeFile(path.join(fixture.root, "big.txt"), big());
+    });
+
+    it("reaches a line far past the read budget", async () => {
+      // The bug: the file was read from byte zero up to a fixed cap and lines
+      // were sliced from *that*, so anything beyond it was unreachable by any
+      // offset — while the tool description told the model to page with one.
+      const result = await fsRead.run({ path: "big.txt", offset: 2_000, limit: 2 }, ctx(small));
+      expect(result.content[0]?.text).toContain("line 1999 ");
+      expect(result.content[0]?.text).toContain("line 2000 ");
+    });
+
+    it("walks the whole file in pages, covering every line exactly once", async () => {
+      const seen: string[] = [];
+      let offset = 1;
+      for (let page = 0; page < 500; page++) {
+        const body = (await fsRead.run({ path: "big.txt", offset }, ctx(small))).content[0]!.text;
+        if (body.includes("past the end")) break;
+        seen.push(...body.split("\n").filter((l) => l.startsWith("line ")));
+        const next = /"offset": (\d+)\}/.exec(body);
+        if (next === null) break;
+        offset = Number(next[1]);
+      }
+      expect(seen).toHaveLength(LINES);
+      expect(seen[0]).toContain("line 0 ");
+      expect(seen[LINES - 1]).toContain(`line ${LINES - 1} `);
+      // No line delivered twice: an off-by-one in the resume offset would show
+      // up here as a duplicate or a hole rather than as a wrong total.
+      expect(new Set(seen).size).toBe(LINES);
+    });
+
+    it("names the resume offset instead of only saying it truncated", async () => {
+      // "Truncated" with no next offset leaves the model to guess one, and the
+      // old notice reported the internal read cap as the denominator — a 271KB
+      // file described as 4096 bytes reads as "you have half of it".
+      const body = (await fsRead.run({ path: "big.txt" }, ctx(small))).content[0]!.text;
+      expect(body).toMatch(/showed lines 1-\d+ of big\.txt \(\d{5,} bytes\)/);
+      expect(body).toMatch(/Continue with \{"path": "big.txt", "offset": \d+\}/);
+    });
+
+    it("says so when the offset is past the end, rather than returning nothing", async () => {
+      // A bare header reads as "the file is empty here", which is what sent a
+      // model round in circles paging a file it had already finished.
+      const body = (await fsRead.run({ path: "big.txt", offset: 99_999 }, ctx(small))).content[0]!.text;
+      expect(body).toContain(`has ${LINES} lines`);
+      expect(body).not.toMatch(/^.*\n$/s);
+    });
+
+    it("keeps multi-byte characters intact across chunk boundaries", async () => {
+      // The scan reads in 64KB chunks; splitting a buffer mid-code-point and
+      // decoding each half is how a reader like this corrupts non-ASCII text.
+      const line = `행 가나다 ${"가".repeat(40)}`;
+      await fsp.writeFile(path.join(fixture.root, "utf8.txt"), `${Array.from({ length: 4_000 }, () => line).join("\n")}\n`);
+      const body = (await fsRead.run({ path: "utf8.txt", offset: 3_500, limit: 2 }, ctx(small))).content[0]!.text;
+      expect(body).toContain(line);
+      expect(body).not.toContain("\uFFFD");
+    });
+
+    it("returns a single over-long line rather than nothing at all", async () => {
+      await fsp.writeFile(path.join(fixture.root, "one.txt"), `${"y".repeat(20_000)}\n`);
+      const body = (await fsRead.run({ path: "one.txt" }, ctx(small))).content[0]!.text;
+      expect(body).toContain("yyyy");
+    });
+
+    it("handles a last line with no trailing newline", async () => {
+      await fsp.writeFile(path.join(fixture.root, "tail.txt"), "alpha\nbeta\ngamma");
+      const body = (await fsRead.run({ path: "tail.txt", offset: 3 }, ctx())).content[0]!.text;
+      expect(body).toContain("gamma");
+      expect(body).not.toContain("past the end");
+    });
   });
 
   it("refuses to read outside the workspace", async () => {
